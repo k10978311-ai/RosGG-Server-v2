@@ -32,6 +32,16 @@ _TLD_SWAP = (("easebar.lan", "easebar.com"), ("netease.lan", "netease.com"),
 
 def canonical_host(host):
     host = (host or "").split(":")[0].lower()
+    # public build (vokdev.com): "<label>e.vokdev.com" = "<label>.easebar.com", "<label>n.vokdev.com" = "<label>.netease.com"
+    if host.endswith(".vokdev.com"):
+        lab = host[: -len(".vokdev.com")]
+        if lab == "wwwrulesofsurviv":
+            return "www.rulesofsurvivalgame.com"
+        if len(lab) > 1 and lab[-1] == "e" and "." in host[:-1]:
+            return lab[:-1] + ".easebar.com"
+        if len(lab) > 1 and lab[-1] == "n":
+            return lab[:-1] + ".netease.com"
+        return host
     for patched, real in _TLD_SWAP:
         if host.endswith(patched):
             return host[: -len(patched)] + real
@@ -165,7 +175,7 @@ class RoSHTTPHandler(BaseHTTPRequestHandler):
         static_map = {
             "/pl/h45na_hc": ("h45na_hc", "application/octet-stream"),
             "/pl/npk_version_na_android.plist": ("npk_version_na_android.patched.plist", "text/plain"),
-            "/server_list_ad.txt": ("server_list_ad.local.txt", "text/plain"),
+            "/server_list_ad.txt": (os.environ.get("SERVER_LIST_FILE", "server_list_ad.local.txt"), "text/plain"),
             "/notice_pc_hw.txt": ("notice_pc_hw.txt", "text/plain"),
         }
         route = static_map.get(self.path.split("?")[0])

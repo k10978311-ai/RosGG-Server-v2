@@ -17,6 +17,8 @@ REDIRECT_SUFFIXES = (
     "rulesofsurvivalgame.com", "nease.net",
     # patched APK (decompile/tools/patch_hosts.py) points SDK hosts at our own TLD
     "easebar.lan", "netease.lan", "rulesofsurvivalgame.lan",
+    # public build hosts (*.vokdev.com); LAN/Gnirehtet testing resolves them to this PC
+    "vokdev.com",
 )
 
 

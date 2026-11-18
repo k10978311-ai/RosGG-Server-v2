@@ -3,7 +3,7 @@
 Goal: run `start.cmd` on your PC and let other people's phones/emulators connect with the patched APK.
 
 ## 1. What players need
-- The patched APK (`client/apk/ros_phone_trustall_debugSigned.apk`, attach it to a GitHub Release; it trusts the server certificate itself, so no CA install).
+- The patched APK (`client/apk/RosGG.apk` (same file as ros_phone_trustall_debugSigned.apk, renamed for sharing; not in Git); it trusts the server certificate itself, so no CA install).
 - Original OBB data files for 1.610637.617289.
 - **DNS**: the patched APK uses `.lan` host names. Players must resolve them to YOUR address. Easiest: they set the phone's Wi-Fi DNS (static) to your public IP, where `dns_server.py` answers. (Changing DNS is a phone setting the player does.)
 
@@ -30,3 +30,10 @@ Opening firewall/router ports is your action (not done by the scripts). Cloudfla
 - `.gitignore` keeps CA/server private keys, `loginapp_priv.pem`, logs and `saved_accounts.json` out of Git. Do not publish them: the test CA is trusted by patched clients.
 - Each repo clone must generate its own certs/keys (see server/certs) before hosting.
 - Only open the ports above; the server has no authentication beyond the game login, so treat it as a public test server.
+
+## 6. Public build (vokdev.com) - done 2026-11-18
+- `client/apk/RosGG.apk` is built for the domain **vokdev.com**: the APK's NetEase hosts became `<label>e.vokdev.com` / `<label>n.vokdev.com` (same-length rewrite, `client/apk_build/rewrite_hosts.py`). The server maps them back (`canonical_host`).
+- Cloudflare DNS (vokdev.com): `play` A -> your public IP, DNS only; `*` A -> same IP, DNS only; `rosggv2` = Cloudflare Tunnel route to `http://localhost:80` (web only; the tunnel does NOT carry UDP).
+- Router: forward UDP+TCP 25000 to this PC.
+- Public server list: start the server with `SERVER_LIST_FILE=server_list_ad.public.txt` (`play.vokdev.com:25000`). LAN testing keeps the default `server_list_ad.local.txt` and `dns_server.py` answers `*.vokdev.com` with the PC IP.
+- Verified on the Note10+ over Gnirehtet with the new APK: DNS/HTTP for vokdev hosts, login, enterHall. Not yet verified from the internet (needs the DNS records + port forward).
