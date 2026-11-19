@@ -1,7 +1,7 @@
 @echo off
 rem ===== RoS private server config (edit this) =====
 rem LAN IP of this PC (must match what the phone/emulator uses as DNS + game server)
-if "%ROS_PC_IP%"=="" set ROS_PC_IP=192.168.1.18
+if "%ROS_PC_IP%"=="" set ROS_PC_IP=192.168.245.137
 rem Lobby test account shown in the hall
 if "%TEST_ACCOUNT_NAME%"=="" set TEST_ACCOUNT_NAME=TestPlayer
 rem Server behaviour (working lobby route: base-only Athlete, method ids 0x80)

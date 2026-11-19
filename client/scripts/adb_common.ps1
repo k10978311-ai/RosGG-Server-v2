@@ -10,10 +10,14 @@ if (-not $script:RosAdb) {
 }
 
 # PC LAN IP used by dns_server / ros_server (override with $env:ROS_PC_IP).
-$script:RosPcIp = if ($env:ROS_PC_IP) { $env:ROS_PC_IP } else { "192.168.1.18" }
+$script:RosPcIp = if ($env:ROS_PC_IP) { $env:ROS_PC_IP } else {
+    $cfg = Select-String -Path (Join-Path $PSScriptRoot "..\..\config.cmd") -Pattern "set ROS_PC_IP=(\S+)" | Select-Object -First 1
+    if ($cfg) { $cfg.Matches[0].Groups[1].Value } else { "192.168.1.18" }
+}
 
 $script:RosPackage = "com.netease.chiji"
-$script:RosPubKey = Join-Path $PSScriptRoot "server_keys\loginapp.pubkey"
+$script:RosServerDir = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\server"))
+$script:RosPubKey = Join-Path $script:RosServerDir "server_keys\loginapp.pubkey"
 $script:RosKeyRemote = "/storage/emulated/0/Android/data/com.netease.chiji/files/netease/h45na/res/entities/loginapp.pubkey"
 
 function Get-RosDevices {

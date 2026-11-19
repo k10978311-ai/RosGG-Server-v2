@@ -2,7 +2,7 @@
 rem Starts DNS + game server. Logs go to logs\. Usage: start.cmd   (stop with stop.cmd)
 setlocal
 cd /d %~dp0
-call config.cmd
+call "%~dp0config.cmd"
 if not exist logs mkdir logs
 set PY=%~dp0..\.venv\Scripts\python.exe
 if not exist "%PY%" set PY=%~dp0.venv\Scripts\python.exe

@@ -6,6 +6,8 @@ import ssl
 import struct
 import threading
 
+import athlete_requests  # client->server Athlete calls by name (server/athlete_requests.py)
+import account_link  # RoS_Server account link (/api/v1/gateway); off when GATEWAY_API_KEY is empty
 import bwdefs   # BigWorld .def parser (server/bwdefs.py)
 
 CERT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
@@ -127,7 +129,7 @@ class RoSHTTPHandler(BaseHTTPRequestHandler):
         # client shows as "Slow connection". Forge the same user record as /users/login/.
         if host_only.endswith("mpsdk.easebar.com") and path_lower.startswith("/api/games/user/info"):
             import time as _t
-            uid = os.environ.get("CBP_GID", "9000000001")
+            uid = account_link.device_uid(self.path)
             body = json.dumps({
                 "code": 0, "alert_type": 0, "msg": "ok",
                 "user": {"id": uid, "token": "localguesttoken0001", "username": "GuestLocal",
@@ -248,7 +250,7 @@ class RoSHTTPHandler(BaseHTTPRequestHandler):
         # or 2003 "User does not exist" (auto-login sdk_token re-validation).
         if host.endswith("mpsdk.easebar.com"):
             import time as _t
-            uid = "9000000001"
+            uid = account_link.device_uid(self.path)
             forged = {
                 "code": 0, "alert_type": 0, "msg": "ok",
                 "user": {
@@ -262,9 +264,9 @@ class RoSHTTPHandler(BaseHTTPRequestHandler):
             }
             if "/api/devices/init" in self.path.lower():
                 # mpay DeviceRequest parses response["device"]["id"]; without it the SDK shows "Slow connection".
-                forged["device"] = {"id": "9000000001-local-device"}
+                forged["device"] = {"id": f"{uid}-local-device"}
             body = json.dumps(forged).encode()
-            print(f"[FORGE mpsdk-post] {self.path} -> {body[:200]!r}")
+            print(f"[FORGE mpsdk-post] uid={uid} {self.path} -> {body[:200]!r}")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -359,7 +361,7 @@ def build_base_player_props(kind):
     if hx is not None:
         return bytes.fromhex(hx)
     name = os.environ.get("CBP_NAME", "GuestLocal")
-    gid = int(os.environ.get("CBP_GID", "9000000001"))
+    gid = account_link.current_gid()
     iproxy = (_bw_blob(bytes(range(16))) + _bw_blob(name) + _bw_blob(b"") +
               _bw_blob(name) + _bw_blob(name) + struct.pack("<Q", gid))
     if kind == "account":
@@ -474,7 +476,7 @@ def avatar_create_messages():
     import pickle as _pk
     D = bwdefs.Defs()
     name = os.environ.get("CBP_NAME", "GuestLocal").encode()
-    gid = int(os.environ.get("CBP_GID", "9000000001"))
+    gid = account_link.current_gid()
     map_id = int(os.environ.get("AVATAR_MAP", "701"))
     char_type = int(os.environ.get("AVATAR_CHAR", "30001"))
     ov = {
@@ -553,7 +555,7 @@ def _encode_appearance_pkg(bwdefs, ids, capacity):
     """DTS_APPEARANCE_PACKAGE3: itemList, itemsList(PYTHON array), layoutInfo, _packageCapacity."""
     import pickle as _pk
     items = b"".join(
-        bwdefs.blob(os.urandom(16)) + struct.pack("<ii", int(i), 1) + bwdefs.blob(_pk.dumps({}, protocol=2))
+        bwdefs.blob(os.urandom(16)) + struct.pack("<ii", int(i), 1) + bwdefs.blob(_pk.dumps({"ex_tm": 0}, protocol=2))
         for i in ids)
     return (struct.pack("<I", len(ids)) + items + struct.pack("<I", 0)
             + bwdefs.blob(_pk.dumps({}, protocol=2)) + struct.pack("<I", int(capacity)))
@@ -604,6 +606,9 @@ def save_account(key, data):
 def is_new_account():
     if os.environ.get("FORCE_NEW_ACCOUNT", "0") == "1":
         return True
+    linked = account_link.current()
+    if linked:                                     # RoS_Server account is the source of truth
+        return bool(linked["is_new"])
     if os.environ.get("TEST_ACCOUNT_NAME"):        # fixed test account: always existing
         return False
     accs = load_accounts()
@@ -613,7 +618,40 @@ def is_new_account():
     return False
 
 
+def _portrait_key():
+    return "portrait:" + str(account_link.current_gid())
+
+
+def get_account_portrait():
+    """FilePicker file id of the player's uploaded avatar ("" = built-in by character type)."""
+    linked = account_link.current()
+    if linked and linked.get("portrait") is not None:
+        return linked["portrait"]
+    v = load_accounts().get(_portrait_key())
+    return v if isinstance(v, str) else ""
+
+
+def set_account_portrait(file_id):
+    save_account(_portrait_key(), file_id)         # local copy (works without RoS_Server)
+    if account_link.current() and not account_link.set_portrait(file_id):
+        print(f"      [ACC-LINK] portrait '{file_id}' not saved to RoS_Server")
+
+
+def _child_props_with_portrait(D, portrait):
+    """childBaseClientPropertyList (ARRAY of one FIXED_DICT): defaults + portrait."""
+    for prop, ttext, _flags, _owner in D.base_client_props("Athlete"):
+        if prop == "childBaseClientPropertyList":
+            fields = D.resolve(ttext)[1][1]
+            elem = b"".join(bwdefs.blob(portrait.encode()) if name == "portrait"
+                            else bwdefs.encode_default(sub, fdef) for name, sub, fdef in fields)
+            return struct.pack("<I", 1) + elem
+    return None
+
+
 def get_account_name():
+    linked = account_link.current()
+    if linked and not linked["is_new"]:
+        return linked["nickname"]
     if os.environ.get("TEST_ACCOUNT_NAME"):
         return os.environ["TEST_ACCOUNT_NAME"]
     accs = load_accounts()
@@ -621,7 +659,30 @@ def get_account_name():
     return acc.get("name", os.environ.get("CBP_NAME", "GuestLocal"))
 
 
+def link_login(username, ip_address):
+    """Resolve the RoS_Server account for a Mercury login. Returns False if the account may not play."""
+    uid = account_link.note_login(username)
+    if not account_link.enabled():
+        return True
+    linked = account_link.resolve(uid, ip_address)
+    if not linked:
+        return True                                # API down: keep playing on local accounts
+    if not linked["can_play"]:
+        print(f"[ACC-LINK] {linked['username']} is {linked['status']}: login refused")
+        return False
+    test_name = os.environ.get("TEST_ACCOUNT_NAME")
+    if linked["is_new"] and test_name:
+        # Fixed test account: skip the in-game character screen, as before the link existed.
+        char = int(os.environ.get("ATHLETE_CHAR", "30001"))
+        if not account_link.set_character(test_name, char):
+            account_link.set_character(f"{test_name}_{uid[-4:]}", char)
+    return True
+
+
 def get_account_char():
+    linked = account_link.current()
+    if linked and linked.get("char_type") is not None:
+        return int(linked["char_type"])
     accs = load_accounts()
     acc = accs.get("default", {})
     return acc.get("char_type", int(os.environ.get("ATHLETE_CHAR", "30001")))
@@ -647,14 +708,25 @@ def build_custom_room_info(room_name, creator_name, gid, map_id=1, team_size=4):
     return b
 
 
+LOGIN_STATE = None   # RoS_Server gateway state of the account logging in (account_link.get_state)
+
+
+def login_yuanbao():
+    if LOGIN_STATE is not None:
+        return int(LOGIN_STATE.get("yuanbao", 0))
+    return int(os.environ.get("ATHLETE_FREE_YUANBAO", "50000")) + int(os.environ.get("ATHLETE_PAY_YUANBAO", "50000"))
+
+
 def athlete_create_message():
     """createBasePlayer for the hall player: Athlete (client type 56), all 720 BASE_AND_CLIENT
     props in .def parse order (bwdefs.py), defaults + identity overrides."""
+    global LOGIN_STATE
     D = bwdefs.Defs()
+    LOGIN_STATE = account_link.get_state() if account_link.current() else None
     new_user = is_new_account()
     raw_name = "" if new_user else get_account_name()
     name = raw_name.encode() if raw_name else b""
-    gid = int(os.environ.get("CBP_GID", "9000000001"))
+    gid = account_link.current_gid()
     seed = _parse_seed_items("ATHLETE_SEED_ITEMS")
     cap = int(os.environ.get("ATHLETE_PKG_CAPACITY", "64"))
     char_type = get_account_char()
@@ -669,8 +741,10 @@ def athlete_create_message():
         "needNormalRoomTip": struct.pack("<b", 0),
         "needOBRoomTip": struct.pack("<b", 0),
         "baseCharacterType": struct.pack("<I", char_type),
-        "freeYuanbao": struct.pack("<q", int(os.environ.get("ATHLETE_FREE_YUANBAO", "50000"))),
-        "payYuanbao": struct.pack("<q", int(os.environ.get("ATHLETE_PAY_YUANBAO", "50000"))),
+        "freeYuanbao": struct.pack("<q", login_yuanbao() if LOGIN_STATE is not None
+                                   else int(os.environ.get("ATHLETE_FREE_YUANBAO", "50000"))),
+        "payYuanbao": struct.pack("<q", 0 if LOGIN_STATE is not None
+                                  else int(os.environ.get("ATHLETE_PAY_YUANBAO", "50000"))),
         **({"dtsAppearancePackage": _encode_appearance_pkg(bwdefs, _all_appearance_ids(), 20000)}
            if os.environ.get("UNLOCK_ALL", "calls") == "stream" else {}),
         "dtsRos2RepertoryPackage": _encode_pkg_items(bwdefs, seed, cap),
@@ -678,6 +752,22 @@ def athlete_create_message():
         "dtsRos2EquipBarPackage": _encode_pkg_items(bwdefs, seed[:7], 7),
         "dtsRos2DfdBattleItemPackage": _encode_pkg_items(bwdefs, [], cap, with_weight=True),
     }
+    if LOGIN_STATE is not None:                    # owned items and worn outfit from RoS_Server
+        owned = [int(i["prop_id"]) for i in LOGIN_STATE.get("items", [])]
+        if owned:
+            ov["dtsAppearancePackage"] = _encode_appearance_pkg(bwdefs, owned, 20000)
+        arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", int(i)) for i in ids)
+        outfit = LOGIN_STATE.get("outfit") or {}
+        if outfit.get("wear"):
+            ov["dtsWearableAppearanceList"] = ov["dtsShowWearableAppearanceList"] = arr(outfit["wear"])
+        if outfit.get("body"):
+            ov["dtsShowBodyAppearanceList"] = arr(outfit["body"])
+        print(f"[*] RoS_Server state: {LOGIN_STATE.get('yuanbao')} diamonds, {len(owned)} items, outfit={outfit}")
+    portrait = get_account_portrait()
+    if portrait:
+        child = _child_props_with_portrait(D, portrait)
+        if child:
+            ov["childBaseClientPropertyList"] = child
     cur_raw = os.environ.get("ATHLETE_SEED_CURRENCY", "1:10000,2:1000").strip()
     if cur_raw:
         curs = []
@@ -717,6 +807,9 @@ class GateUDP(asyncio.DatagramProtocol):
         self._last_recv = {}        # addr -> time of the last BaseApp packet from the client
         self._last_sent_ka = {}     # addr -> time of last sent keepalive ACK
         self._ka_gen = 0            # bumped per BaseApp login; stale keepalive timers stop
+        self._supply = {}           # addr -> athlete_requests.SupplyState
+        self._wallet = {}           # addr -> athlete_requests.Wallet
+        self._outfit = {}           # addr -> athlete_requests.Outfit
     def connection_made(self, transport):
         self.transport = transport
     def datagram_received(self, data, addr):
@@ -755,6 +848,8 @@ class GateUDP(asyncio.DatagramProtocol):
                     global CURRENT_SESSION_U32
                     CURRENT_BF_KEY = bf
                     CURRENT_SESSION_U32 = loginapp.extract_session_u32(params)
+                    if not link_login(params.get("username"), addr[0]):
+                        return              # banned/suspended in the admin console: no login reply
                     sk = CURRENT_SESSION_U32.hex()
                     print(f"  [{_t.strftime('%H:%M:%S')}] [LOGIN] TRY msgid={msgid} (0x{msgid:02x}) -> {len(pkt)}B: {pkt.hex()}")
                     print(f"      user={params.get('username')} session_u32={sk} rest={params.get('rest',b'').hex()} bf={bf.hex() if bf else None}")
@@ -914,62 +1009,13 @@ class GateUDP(asyncio.DatagramProtocol):
                     if any(m in (0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xD0) for m, _ in msgs):
                         self._send_enter_hall_calls(addr, bytes(bf_key))
 
-                # Handle Athlete client->server requests (Base methods)
-                for m, p in msgs:
-                    # 1. createCharacter (Base method 1673 -> mid 0xFD, sub 0x52 or 0x36)
-                    if m == 0xFD and len(p) >= 5 and p[0] in (0x52, 0x36):
-                        try:
-                            career_type = struct.unpack_from("<i", p, 1)[0]
-                            offset = 5
-                            str_len = p[offset]
-                            offset += 1
-                            if str_len == 0xFF:
-                                str_len = struct.unpack_from("<H", p, offset)[0]
-                                offset += 2
-                            char_name = p[offset:offset+str_len].decode("utf-8", errors="replace")
-                            print(f"      [BASEAPP] Athlete.createCharacter: name='{char_name}', type={career_type}")
-                            save_account("default", {"name": char_name, "char_type": career_type})
-                            body += (
-                                athlete_method("onCreateCharacter", b"\x01" + _bw_blob(b"")) +
-                                athlete_method("onRoleCreateSuc", struct.pack("<i", 1)) +
-                                athlete_method("updateBaseNickname", _bw_blob(char_name.encode())) +
-                                athlete_method("updateBaseCharacter", struct.pack("<i", career_type)) +
-                                athlete_method("onSyncSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
-                                athlete_method("onSetSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
-                                self._lobby_data_calls() +
-                                athlete_method("enterHall", b"\x01")
-                            )
-                            print(f"      [BASEAPP] Responded with onCreateCharacter + updateNickname + enterHall(1)")
-                        except Exception as e:
-                            print(f"      [BASEAPP] Error handling createCharacter: {e}")
-
-                    # 2. requestRoomListInfo (Base method 418 -> mid 0xF8, sub 0x6B or 0xBF)
-                    if m == 0xF8 and len(p) >= 1 and p[0] in (0x6B, 0xBF):
-                        try:
-                            body += athlete_method("onRequestRoomListInfo", struct.pack("<I", 0) + struct.pack("<i", 0))
-                            print(f"      [BASEAPP] Responded to requestRoomListInfo with empty room list")
-                        except Exception as e:
-                            print(f"      [BASEAPP] Error handling requestRoomListInfo: {e}")
-
-                    # 3. requestRoomCountInfo (Base method 419 -> mid 0xF8, sub 0x6C or 0xC0)
-                    if m == 0xF8 and len(p) >= 1 and p[0] in (0x6C, 0xC0):
-                        try:
-                            body += athlete_method("onRequestRoomCountInfo", struct.pack("<iii", 0, 0, 0))
-                            print(f"      [BASEAPP] Responded to requestRoomCountInfo")
-                        except Exception as e:
-                            print(f"      [BASEAPP] Error handling requestRoomCountInfo: {e}")
-
-                    # 4. createDtsCustomGame (Base method 411 -> mid 0xF8, sub 0x64 or 0xBA)
-                    if m == 0xF8 and len(p) >= 1 and p[0] in (0x64, 0xBA):
-                        try:
-                            creator_name = get_account_name()
-                            room_name = f"{creator_name}'s Room"
-                            gid = int(os.environ.get("CBP_GID", "9000000001"))
-                            room_info = build_custom_room_info(room_name, creator_name, gid)
-                            body += athlete_method("onCreateDtsCustomGame", room_info)
-                            print(f"      [BASEAPP] Responded to createDtsCustomGame -> onCreateDtsCustomGame for host '{creator_name}'")
-                        except Exception as e:
-                            print(f"      [BASEAPP] Error handling createDtsCustomGame: {e}")
+                # Athlete client->server requests (exposed base methods), decoded by name
+                # (athlete_requests.py; ids fitted on real traffic).
+                if self._athlete_sent.get(addr):
+                    for m, p in msgs:
+                        call = athlete_requests.decode(m, p)
+                        if call:
+                            body += self._athlete_request(addr, call[0], call[1])
 
                 # Account.handshake = exposed base method 5 -> msg 0xC5 (confirmed). Answer with
                 # Account client methods (parse order: iProxy 0-10, iQueue 11-12, iActivation 13,
@@ -1007,8 +1053,8 @@ class GateUDP(asyncio.DatagramProtocol):
                 if any(m == 0xC5 for m, _ in msgs) and addr not in self._handshake_done:
                     self._handshake_done[addr] = True
                     eid = int(os.environ.get("CBP_ID", "10001"), 0)
-                    sauth = {"uid": os.environ.get("CBP_GID", "9000000001"),
-                             "aid": os.environ.get("CBP_GID", "9000000001"),
+                    sauth = {"uid": str(account_link.current_gid()),
+                             "aid": str(account_link.current_gid()),
                              "token": "localguesttoken0001", "login_type": 7}
                     import pickle
                     i_ch = int(os.environ.get("IDX_ONCHANNELLOGIN", "19"))
@@ -1171,6 +1217,162 @@ class GateUDP(asyncio.DatagramProtocol):
             for t in [float(x) for x in os.environ.get("APPEARANCE_PUSH", "").split(",") if x.strip()]:
                 asyncio.get_event_loop().call_later(t, self._push_appearance, addr, bytes(bf_key))
 
+    def _athlete_request(self, addr, name, args):
+        """Reply to one decoded Athlete base call. Unknown names are only logged."""
+        import time as _t
+        rd = athlete_requests.Reader(args)
+        py = athlete_requests.py
+        if name not in athlete_requests.QUIET:
+            print(f"      [BASEAPP] <- Athlete.{name} args={args.hex()[:80]}")
+        try:
+            if name == "createCharacter":
+                career_type = rd.i32()
+                char_name = rd.string()
+                print(f"      [BASEAPP] Athlete.createCharacter: name='{char_name}', type={career_type}")
+                save_account("default", {"name": char_name, "char_type": career_type})
+                if account_link.current() and not account_link.set_character(char_name, career_type):
+                    print(f"      [ACC-LINK] character '{char_name}' not saved to RoS_Server")
+                return (athlete_method("onCreateCharacter", b"\x01" + _bw_blob(b"")) +
+                        athlete_method("onRoleCreateSuc", struct.pack("<i", 1)) +
+                        athlete_method("updateBaseNickname", _bw_blob(char_name.encode())) +
+                        athlete_method("updateBaseCharacter", struct.pack("<i", career_type)) +
+                        athlete_method("onSyncSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
+                        athlete_method("onSetSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
+                        self._lobby_data_calls() +
+                        athlete_method("enterHall", b"\x01"))
+            if name == "requestRoomListInfo":
+                return athlete_method("onRequestRoomListInfo", struct.pack("<I", 0) + struct.pack("<i", 0))
+            if name == "requestRoomCountInfo":
+                return athlete_method("onRequestRoomCountInfo", struct.pack("<iii", 0, 0, 0))
+            if name == "createDtsCustomGame":
+                creator_name = get_account_name()
+                room_info = build_custom_room_info(f"{creator_name}'s Room", creator_name, account_link.current_gid())
+                print(f"      [BASEAPP] createDtsCustomGame -> onCreateDtsCustomGame for host '{creator_name}'")
+                return athlete_method("onCreateDtsCustomGame", room_info)
+
+            # Supply boxes (draws). Free: no currency check or deduction on this private server.
+            supply = self._supply.setdefault(addr, athlete_requests.SupplyState())
+            if name == "queryAvailableSupplement":
+                return (athlete_method("onQueryAvailableSupplement", py(athlete_requests.supplement_info())) +
+                        athlete_method("onUpdateFreeLotteryTimeStampDict", py(supply.free_ts) + py(supply.free_times)))
+            if name == "openSupplyBoxFree":
+                sid = rd.i32()
+                prizes = athlete_requests.draw(sid, 1)
+                supply.note_free(sid)
+                self._settle(addr, 0, prizes, f"free:{sid}")
+                print(f"      [BASEAPP] free draw box {sid} -> {prizes}")
+                return (athlete_method("onUpdateFreeLotteryTimeStampDict", py(supply.free_ts) + py(supply.free_times)) +
+                        self._grant_props(prizes) +
+                        athlete_method("onOpenFreeSupplyBox", struct.pack("<i", sid) + py(prizes)))
+            if name in ("openSupplyBox", "openMultipleSupplyBox"):
+                multi = name == "openMultipleSupplyBox"
+                sid, currency = rd.i32(), rd.i32()           # 2nd arg: chosen currency id
+                rd.i32_array()                                # cash coupons (ignored)
+                watch_ad = rd.i8() if not multi and rd.i < len(rd.b) else 0
+                price = athlete_requests.draw_price(sid, currency, multi)
+                diamonds = price if currency == athlete_requests.YUANBAO else 0
+                prizes = athlete_requests.draw(sid, athlete_requests.multi_count(sid) if multi else 1)
+                if not self._settle(addr, diamonds, prizes, f"draw:{sid}"):
+                    return athlete_method(
+                        "onMultiOpenSupplyBoxFailed" if multi else "onOpenSupplyBoxFailed",
+                        struct.pack("<i", sid) + _bw_blob(b"") + struct.pack("<ii", currency, price) + struct.pack("<I", 0))
+                print(f"      [BASEAPP] {'multi ' if multi else ''}draw box {sid} currency={currency} price={price} -> {prizes}")
+                calls = (self._diamond_props(addr) if diamonds else b"") + self._grant_props(prizes)
+                if multi:
+                    return calls + athlete_method("onMultiOpenSupplyBox", struct.pack("<i", sid) + py(prizes))
+                return calls + athlete_method("onOpenSupplyBox", struct.pack("<i", sid) + py(prizes) + bytes([1 if watch_ad else 0]))
+
+            # Wardrobe / mall buys. Hall props are paid in the client's own listed currency
+            # and price (extract/hallprop_prices.json); the won item is added for the session.
+            if name in ("buyDtsHallProp", "buyMallGoodInAppearanceMall", "buyMallGood"):
+                good = rd.i32()
+                price = athlete_requests.hallprop_price(good) if name == "buyDtsHallProp" else None
+                cur, amount = price or (athlete_requests.YUANBAO, 0)
+                diamonds = amount if cur == athlete_requests.YUANBAO else 0
+                if not self._settle(addr, diamonds, [good], f"buy:{good}"):
+                    print(f"      [BASEAPP] {name} {good}: not enough currency {cur} ({amount})")
+                    return athlete_method("onBuyMallGoodFailed", _bw_blob(b"") + struct.pack("<iiii", good, 1, cur, amount)
+                                          + struct.pack("<I", 0) + _bw_blob(b""))
+                print(f"      [BASEAPP] {name} {good} price={price}")
+                return (self._diamond_props(addr) if diamonds else b"") + self._grant_props([good], force=True) + athlete_method("onBuyMallGood", struct.pack("<Ii", 1, good))
+
+            if name == "getOpenMaintenanceFightTipFlag":     # START button asks this first
+                return athlete_method("onGetOpenMaintenanceFightTipFlag", b"\x00" + struct.pack("<i", 0))
+
+            if name == "equipAppearance":
+                pid = rd.i32()
+                outfit = self._session_outfit(addr)
+                kind = outfit.equip(pid)
+                if kind and account_link.current() and not account_link.set_outfit(outfit.body, outfit.wear):
+                    print("      [ACC-LINK] outfit not saved to RoS_Server")
+                arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", i) for i in ids)
+                calls = b""
+                if kind == "body":
+                    calls += (athlete_method("onUpdateDtsShowBodyAppearanceList", arr(outfit.body)))
+                elif kind == "wear":
+                    calls += (athlete_method("onUpdateDtsWearableAppearanceList", arr(outfit.wear)) +
+                              athlete_method("onUpdateDtsShowWearableAppearanceList", arr(outfit.wear)))
+                print(f"      [BASEAPP] equipAppearance {pid} ({kind}) body={outfit.body} wear={outfit.wear}")
+                return calls + athlete_method("onNotifyEquipedAppearance", struct.pack("<i", pid))
+
+            # Avatar upload: token for the FilePicker upload, then the chosen file id.
+            if name == "requestFilePickerToken":
+                return athlete_method("onRequestFilePickerToken", _bw_blob(b"ros-local-filepicker") + struct.pack("<i", 0))
+            if name == "setPortrait":
+                fid = rd.string()
+                set_account_portrait(fid)
+                print(f"      [BASEAPP] setPortrait -> '{fid}'")
+                return athlete_method("onSetPortrait", _bw_blob(fid.encode()))
+        except Exception as e:
+            print(f"      [BASEAPP] Error handling Athlete.{name}: {e!r}")
+        return b""
+
+    def _diamond_props(self, addr):
+        """iCurrency.onYBUpdated(freeYuanbao, payYuanbao, src) with the session's diamond balance
+        (the lobby shows their sum; all of it is reported as free diamonds)."""
+        total = self._session_wallet(addr).balances.get(athlete_requests.YUANBAO, 0)
+        return athlete_method("onYBUpdated", struct.pack("<qqi", total, 0, 0))
+
+    def _session_wallet(self, addr):
+        """Diamonds: RoS_Server balance loaded at login, else the ATHLETE_*_YUANBAO defaults."""
+        if addr not in self._wallet:
+            self._wallet[addr] = athlete_requests.Wallet({athlete_requests.YUANBAO: login_yuanbao()})
+        return self._wallet[addr]
+
+    def _session_outfit(self, addr):
+        if addr not in self._outfit:
+            outfit = athlete_requests.Outfit()
+            saved = (LOGIN_STATE or {}).get("outfit") or {}
+            outfit.body, outfit.wear = list(saved.get("body", [])), list(saved.get("wear", []))
+            self._outfit[addr] = outfit
+        return self._outfit[addr]
+
+    def _settle(self, addr, diamonds, props, reason):
+        """Charge `diamonds` and record `props` as owned. RoS_Server is the source of truth when
+        linked (one transaction; refuses when the balance is too low); otherwise session only."""
+        wallet = self._session_wallet(addr)
+        if account_link.current():
+            result = account_link.purchase(diamonds, props, reason)
+            if result and "_error" in result:
+                return False
+            if result:
+                wallet.balances[athlete_requests.YUANBAO] = int(result["yuanbao"])
+                return True
+            print(f"      [ACC-LINK] {reason}: RoS_Server unreachable, not saved")
+        return wallet.pay(athlete_requests.YUANBAO, diamonds) if diamonds else True
+
+    def _grant_props(self, prop_ids, force=False):
+        """Add won appearance items to the client's package (other prop kinds: display only)."""
+        appearance = set(_all_appearance_ids())
+        info = _bw_blob(__import__("pickle").dumps({"ex_tm": 0}, protocol=2))
+        calls = b""
+        for iid in prop_ids:
+            if force or iid in appearance:
+                item = _bw_blob(os.urandom(16)) + struct.pack("<i", 1) + info + struct.pack("<i", 0)
+                calls += athlete_method("onAddDtsAppearanceItem",
+                                        struct.pack("<iI", iid, 1) + item + struct.pack("<ii", 0, 0), quiet=True)
+        return calls
+
     def _lobby_data_calls(self):
         """Client-side Athlete attributes the real server fills at login (lobby UI reads them in
         UIMain.on_enter; a missing one aborts the whole lobby UI setup)."""
@@ -1210,6 +1412,11 @@ class GateUDP(asyncio.DatagramProtocol):
             calls += athlete_method("onUpdateBuySupplementCntDict", py({}) + py({}) + py({}))
         except Exception as e:
             print(f"      [BASEAPP] Warning: onQueryAvailableSupplement skipped: {e}")
+        try:
+            # iVip.syncVipInfo; draw-result and ad screens read vipInfo["level"] / ["rewardStatus"].
+            calls += athlete_method("syncVipInfo", py({"level": 0, "exp": 0, "rewardStatus": {}}))
+        except Exception as e:
+            print(f"      [BASEAPP] Warning: syncVipInfo skipped: {e}")
         try:
             calls += athlete_method("syncMonthPayRebateSpecialAwardInfo", py(month_rebate))
         except Exception as e:

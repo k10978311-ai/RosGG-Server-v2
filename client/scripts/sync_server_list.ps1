@@ -1,7 +1,7 @@
 # Rewrite game-server IPs in server/real/server_list_ad.local.txt to match $env:ROS_PC_IP (or adb_common default).
 . "$PSScriptRoot\adb_common.ps1"
 
-$path = Join-Path $PSScriptRoot "real\server_list_ad.local.txt"
+$path = Join-Path $script:RosServerDir "real\server_list_ad.local.txt"
 if (-not (Test-Path $path)) { throw "Missing $path" }
 
 $ip = $RosPcIp

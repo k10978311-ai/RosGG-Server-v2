@@ -22,3 +22,37 @@ Update 2026-11-18: lobby UI reached on LDPlayer after ~6 load/drop cycles (hall.
 Lobby UI bug (2026-11-18): first lobby button press (e.g. char tap -> Supply) then back throws AttributeError in UIMain.setModelVisible because UIMain.models[gid]['loader'] is None (self hero has empty dts*AppearanceList props). After that every enter_ui throws (UISupplyController.on_leave) so ALL lobby buttons are dead until relogin. Appearance data tables on client are not loaded (dts_appearance_utils.getBodyAppearanceData() raises in preprocessBodyAppearanceData), so valid appearance ids can't be listed from the client; pushing onSetDtsAppearanceGender/onUpdateDtsShow*List (ros_server._push_appearance, trigger via harness/push_now.flag) did not create the model/loader. Hero model only appears after leaving a sub-UI (displayAll).
 
 Breakthrough 2026-11-18: UIMain.on_enter was aborting on AttributeError 'PlayerAthlete' has no attribute 'iLuckyCarnivalIsSuper' (set only by client method Athlete.onUpdateLuckyCarnivalData, a PYTHON pickle dict, op 10000). Fixed by ros_server._lobby_data_calls() sent before enterHall -> full lobby UI + hero + top menu appear. Remaining: UIMain.on_enter next aborts at UIMain.py:1651 -> showRedPoint (line 2708) 'NoneType' not iterable; left-menu buttons (Store/Supply/Depot/Top-up) and Lucky Club do nothing (probably unbound because on_enter aborted), but top-bar profile + Outfit page open. Outfit page empty: dts_appearance_utils data tables fail (KeyError 8 / legacyProperties). Pattern: look for first SCRIPT traceback after hall2 load, supply the missing Athlete attribute via the client method that sets it.
+
+## Update 2026-11-19: portrait, FilePicker upload, draw tutorial
+
+Found with read-only Frida payloads (`client/frida/payloads/portrait_*.py`, run via `neox_py_eval.js --realm emulated`).
+
+**Portrait (hall avatar).** `UIMain._init_profile` calls `client_utils.getAvatarProtrait(widget, roleID=baseCharacterType, fileID=portrait)`:
+- `portrait` empty or `'0'`: built-in image `ui/images/avatar/portrait/<baseCharacterType>_on.png`.
+- otherwise `portrait` is a FilePicker file id: downloaded from `http://g89ros.fp.ps.easebar.com:80/file/<id>?fop=imageView/0/w/800/h/600/f/jpeg/q/50` and cached as `ui/images/tantan/<id>.png`.
+- `portrait` lives in Athlete `childBaseClientPropertyList` (FIXED_DICT field `portrait`, STRING). The gateway sends it empty.
+- char 30001 (robot placeholder) showed a grey avatar; switched the test account to 20001 (Human male), which renders in the Supply screen. The hall avatar with 20001 is not yet confirmed.
+
+**Upload flow (not implemented yet).**
+1. Athlete base `requestFilePickerToken()` -> client `onRequestFilePickerToken(STRING token, INT32)`.
+2. `POST http://fp.ps.easebar.com:80/g89ros/file/new/` with `Authorization: <token>`; reply JSON `{"url": ".../<fileID>"}`.
+3. `meetconfigs.MEET_URL` (currently `http://<PC IP>:443`, plain HTTP) + `/TanTanService/setPortrait?...`; reply JSON `{"Ret": 0, "Data": {"PORTRAIT": "<fileID>"}}`.
+4. Client calls Athlete base `setPortrait(STRING fileID)`; server answers `onSetPortrait(STRING)` and stores it.
+
+**Exposed base-method ids (solved).** The client's own table (EntityDescription(Athlete)+0x160 = 1748 base method descriptors, +0x178 = 1191 exposed indices; `client/frida/dump_base_methods.js`) is saved as `server/extract/athlete_base_exposed.json`. It equals the `.def` order plus 24 methods our def parse does not mark exposed. Ids: index < 57 -> msg `0xC0 + index`; otherwise `k = index - 57`, msg `0xF9 + (k >> 8)`, sub byte `k & 0xff`. Every logged request fits its argument types under this rule. `server/athlete_requests.py` decodes by name; the gateway logs each request as `<- Athlete.<name>`.
+
+**Draw tutorial.** After enterHall the first-time "Supreme Supply" tutorial shows "Draw for free" / "Skip". Both send base requests (e.g. `F9 F5`) that the gateway does not answer, so the screen waits forever.
+
+**Supply draws (working).** The Supply screen sends `queryAvailableSupplement` (`F9 F5`); the gateway answers `onQueryAvailableSupplement(extract/supplement_info.json)` and `onUpdateFreeLotteryTimeStampDict`. Box info shape: single-currency boxes (`Constant*` currency option) use scalar `CURRENCY_ID` / `BUY_TIMES_PRICE` / `BUY_MULTIPLE_TIMES_PRICE`; two-currency boxes use 2-element lists (a list for a single-currency box crashed `currency_utils.getCurrencyIcon` and left the buy buttons unbound). Result screens also read `NEXT_BUY_TIMES_PRICE`. `openSupplyBox` / `openSupplyBoxFree` / `openMultipleSupplyBox` roll prizes uniformly from `extract/supplement_props.json` (client `getAllPossiblePropID`), add won appearance items for the session, and do not charge currency.
+
+**Still open.** Supreme Supply (monthly box) is blank: `UIMonthlySupplyPackage.Awake` gets `getCurrentMonthSupplementID() -> None` because the client's monthly boxes are dated years before the device clock. Avatar upload: the gateway answers `requestFilePickerToken` and `setPortrait` (stored in RoS_Server `gateway_identities.portrait`, sent back at login in `childBaseClientPropertyList`), but the FilePicker upload and TanTanService HTTP endpoints are not served yet.
+
+## Update 2026-11-19 (2): buy, wear, diamonds, START
+
+- **Draw arguments.** `openSupplyBox(sid, currencyID, coupons, isWatchAd)` and `openMultipleSupplyBox(sid, currencyID, coupons)`: the 2nd INT32 is the chosen currency, not a count. Single draw = 1 prize, multi = 10. Diamond (currency 2) draws are charged from the box price (`athlete_requests.draw_price`).
+- **Diamonds.** Shown value = `freeYuanbao + payYuanbao`. Updated by client method `iCurrency.onYBUpdated(INT64 free, INT64 pay, INT32 src)`; `onCurrencyUpdated(2, ...)` and 0xC0 property updates do not change it. Draw-result screens also need `vipInfo` (`syncVipInfo({"level","exp","rewardStatus"})` at login).
+- **Wardrobe buy.** Depot BUY -> `buyDtsHallProp(propID, coupons, logStr)`. Prices: `extract/hallprop_prices.json` (client `mall_utils`, 1064 props, all diamonds). Reply: `onYBUpdated` + `onAddDtsAppearanceItem` + `onBuyMallGood([id])`; the item shows under Owned.
+- **Wear.** Tapping an owned item -> `equipAppearance(id)`. Reply: `onUpdateDtsWearableAppearanceList` + `onUpdateDtsShowWearableAppearanceList` (or `onUpdateDtsShowBodyAppearanceList` for body parts) + `onNotifyEquipedAppearance(id)`. Kind from `extract/hall_props.json` by_type. Session only (not stored).
+- **START.** Sends `getOpenMaintenanceFightTipFlag` (answered `onGetOpenMaintenanceFightTipFlag(False, 0)`), then `createHallTeam(INT32 mode)` and `getReadyForBattleGround()`. Next replies needed: `onEnterHallTeam(...)`, `syncReadyState`, `syncMatchState`, then a battle space (not implemented).
+- **Supreme Supply** first opens on the monthly page, blank because `getCurrentMonthSupplementID()` compares the device clock (2026) with monthly box dates; the other Supreme boxes show after re-entering the screen.
+

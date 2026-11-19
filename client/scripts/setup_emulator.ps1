@@ -11,7 +11,7 @@ $PC_IP = $script:RosPcIp
 $serial = Resolve-RosSerial -Target ldplayer
 if (-not $serial) { throw "LDPlayer not found (emulator-5554). Start LDPlayer first." }
 $adbArgs = @("-s", $serial)
-$caFile = Get-ChildItem "$PSScriptRoot\certs\*.0" | Select-Object -First 1
+$caFile = Get-ChildItem "$script:RosServerDir\certs\*.0" | Select-Object -First 1
 
 & $adb @adbArgs root | Out-Null
 & $adb @adbArgs wait-for-device
@@ -32,7 +32,7 @@ $n = $caFile.Name
 & $adb @adbArgs shell "iptables -t nat -C OUTPUT -p udp --dport 53 -j DNAT --to-destination ${PC_IP}:53 2>/dev/null || iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination ${PC_IP}:53; iptables -t nat -L OUTPUT -n | grep 53"
 
 # Install custom loginapp.pubkey so client encrypts login with our key
-$pubKey = "$PSScriptRoot\server_keys\loginapp.pubkey"
+$pubKey = "$script:RosServerDir\server_keys\loginapp.pubkey"
 if (Test-Path $pubKey) {
     Push-RosLoginPubKey -Serial $serial
 }

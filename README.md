@@ -1,10 +1,10 @@
-# RoS Open Play Server (v2, clean layout)
+# BigWorld gateway (RoS open play server v2)
 
 Preservation/research server for Rules of Survival 1.610637.617289 (BigWorld Mercury, UDP/TCP :25000).
-This folder is the self-contained server: `server/ros_server.py` is the main game server (login, lobby, HTTP/HTTPS/DNS targets, UDP/TCP gates), not a test mock. The working project outside this folder is untouched.
+Imported from RosGG-Server-v2 (commit 48522b6). This folder is the gateway for the original client: `server/ros_server.py` handles login, lobby, HTTP/HTTPS/DNS targets and the UDP/TCP gates. It runs on its own, separate from the FastAPI app in `app/`, and uses the repository `.venv`.
 
 ```
-ros_server_v2/
+bigworld_gateway/
   start.cmd / stop.cmd     launcher (DNS + game server), reads config.cmd
   config.cmd               PC IP, test account, lobby route settings
   requirements.txt
@@ -38,3 +38,12 @@ pattern are in `docs/LOBBY_FINDINGS.md`. Character type is set in `server/saved_
 ## Next: real launcher
 A single GUI/CLI launcher can wrap `start.cmd` + `install_ros.ps1`: detect adb device,
 write the PC IP into config + server list, start the server, install/launch the APK.
+
+## Accounts in RoS_Server
+`server/account_link.py` links each login to a RoS_Server account through `/api/v1/gateway`. It reads `GATEWAY_API_KEY` (and optional `ROS_API_URL`, default `http://127.0.0.1:8000`) from the environment or from the repository `.env`. Start the FastAPI server first. Then:
+- each device gets its own uid, hashed from the `ci=` device id in its SDK requests (`CBP_GID` pins one uid, `DEVICE_UIDS=off` shares `9000000001`);
+- the first login creates account `gw_<uid>`, visible in the admin console;
+- with `TEST_ACCOUNT_NAME` set, a new account gets that nickname (or `<name>_<last 4 uid digits>` if taken) and `ATHLETE_CHAR` without the character screen;
+- a nickname changed in the admin console is used on the next login;
+- a suspended or banned account gets no login reply.
+If the key is empty or the API is down, the gateway falls back to `server/saved_accounts.json`.

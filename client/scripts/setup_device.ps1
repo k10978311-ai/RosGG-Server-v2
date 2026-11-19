@@ -21,7 +21,7 @@ Write-Host "[+] Private DNS off"
 
 Push-RosLoginPubKey -Serial $Serial
 
-$caCrt = Join-Path $PSScriptRoot "certs\ca.crt"
+$caCrt = Join-Path $script:RosServerDir "certs\ca.crt"
 $remoteCa = "/sdcard/Download/ros_harness_ca.crt"
 if (Test-Path $caCrt) {
     & $RosAdb -s $Serial push $caCrt $remoteCa | Out-Null

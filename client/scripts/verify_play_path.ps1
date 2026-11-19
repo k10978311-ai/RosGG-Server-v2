@@ -2,7 +2,7 @@
 . "$PSScriptRoot\adb_common.ps1"
 
 $ip = $RosPcIp
-$listFile = Join-Path $PSScriptRoot "real\server_list_ad.local.txt"
+$listFile = Join-Path $script:RosServerDir "real\server_list_ad.local.txt"
 $listLine = (Get-Content $listFile -First 1).Trim()
 Write-Host "PC harness IP (ROS_PC_IP): $ip"
 Write-Host "server_list_ad.local.txt:  $listLine"
