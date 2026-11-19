@@ -3,7 +3,7 @@
 Standard library only. If the API is not configured or not reachable, every call
 returns None and ros_server.py keeps its local saved_accounts.json behaviour.
 
-Settings (environment first, then the repository .env two folders up):
+Settings (environment first, then <gateway>/.env, then the RoS_Server .env two folders up):
   ROS_API_URL      default http://127.0.0.1:8000
   GATEWAY_API_KEY  shared key; empty turns the link off
 """
@@ -16,8 +16,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
-TIMEOUT = float(os.environ.get("ROS_API_TIMEOUT", "2"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ENV_FILES = (os.path.join(_HERE, "..", ".env"), os.path.join(_HERE, "..", "..", ".env"))
 DEFAULT_UID = "9000000001"
 _DEVICE_ID = re.compile(r"[0-9a-f]{8,64}")
 
@@ -61,14 +61,17 @@ def current_gid():
 
 
 def _dotenv(name):
-    try:
-        with open(_ENV_FILE, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith(name + "="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
+    for env_file in _ENV_FILES:
+        try:
+            with open(env_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith(name + "="):
+                        value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if value:
+                            return value
+        except OSError:
+            pass
     return ""
 
 
@@ -99,7 +102,7 @@ def _call(method, path, body):
         headers={"Content-Type": "application/json", "X-Gateway-Key": key},
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=float(_setting("ROS_API_TIMEOUT", "2"))) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         detail = e.read()[:200]

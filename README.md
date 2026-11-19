@@ -30,6 +30,23 @@ bigworld_gateway/
 3. `start.cmd`, then `client\scripts\sync_server_list.ps1` and `client\scripts\verify_play_path.ps1`.
 4. Install the game: `client\scripts\install_ros.ps1`. Launch it and press PLAY.
 
+## Accounts and admin console (`.env`)
+Copy `.env.example` to `.env` in this folder (`.env` is gitignored, never commit it).
+`server/account_link.py` reads the environment first, then this `.env`, then `RoS_Server/.env`.
+
+| Setting | Used by | Meaning |
+|---|---|---|
+| `ROS_API_URL` | gateway | RoS_Server API, default `http://127.0.0.1:8000` |
+| `GATEWAY_API_KEY` | gateway + RoS_Server | shared key, must match `RoS_Server/.env`; empty = no link |
+| `ROS_API_TIMEOUT` | gateway | seconds before falling back to local accounts (default 2) |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | RoS_Server | admin console login; RoS_Server creates this operator on startup |
+
+- **Linked** (`GATEWAY_API_KEY` set and RoS_Server running): each device logs in as `gw_<uid>`.
+  The admin console lists, renames and bans these accounts. A banned or suspended account gets no login reply.
+- **Not linked**: accounts are kept in `server/saved_accounts.json`. `TEST_ACCOUNT_NAME` in `config.cmd`
+  sets the lobby name of the test account.
+- The admin password belongs only in `.env` files. Ask the server owner for it. Don't put it in the README, the code or chat.
+
 ## Status (2026-11-18)
 Login -> lobby works (base-only Athlete). Lobby UI loads; remaining work and the debugging
 pattern are in `docs/LOBBY_FINDINGS.md`. Character type is set in `server/saved_accounts.json`

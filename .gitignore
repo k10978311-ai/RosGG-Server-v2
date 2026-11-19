@@ -12,3 +12,5 @@ __pycache__/
 server/saved_accounts.json
 # large binaries: attach to GitHub Releases instead
 client/apk/*.apk
+# local settings / secrets
+.env
