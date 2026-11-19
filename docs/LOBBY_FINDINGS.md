@@ -103,3 +103,11 @@ The client's date-gated data ends in 2022 (season 21: 2022.03.16-05.24; the last
 - **SET (clothes suits).** `putOnAppearanceClothSuit(sid)` / `takeOffAppearanceClothSuit(sid)`; contents from `legacyProperties.getAppearanceSuitData(sid).PROP_TYPE` (`SUIT_ELEMENT_APPEARANCE_ID`, GENDER), 14 suits. Owned pieces are equipped, the rest previewed.
 - **Saved inventory.** Without a RoS_Server link, owned items, outfit (all lists + theme) and diamonds are kept in `saved_accounts.json` (`inventory:<gid>`) and sent at login like the linked state.
 - **Probes.** `tools/probe.sh` needs a Windows path (`C:/...`) for the payload, or adb pushes nothing and the previous payload runs. Several sessions probing one emulator overwrite each other's `py_payload.py`.
+
+## Update 2026-11-19 (7): items, diamonds and outfit saved in RoS_Server
+
+- RoS_Server keeps the original-client state per gateway identity: `gateway_items` (prop_id, number), `gateway_identities.outfit` ({body, wear}) and the diamond balance as currency `yuanbao` in the normal ledger (`currency_transactions`, reasons `gateway:start`, `gateway:draw:<box>`, `gateway:buy:<prop>`). New players start with `GATEWAY_STARTING_YUANBAO` (default 100000).
+- API (X-Gateway-Key): `GET /api/v1/gateway/accounts/{uid}/state`, `POST .../purchase` {price, props, reason} (charge + add items in one transaction, 409 if too few diamonds), `PUT .../outfit` {body, wear}.
+- Gateway: login loads the state once (`ros_server.LOGIN_STATE`) and puts it in the Athlete props (`freeYuanbao`, `dtsAppearancePackage` with `info={"ex_tm": 0}`, `dtsWearableAppearanceList` / `dtsShowWearableAppearanceList`, `dtsShowBodyAppearanceList`). Every draw/buy goes through `GateUDP._settle` -> `account_link.purchase`; equips call `account_link.set_outfit`. Without the link (no `GATEWAY_API_KEY` or API down) it falls back to session-only.
+- Verified on LDPlayer: after draws (diamonds 99510, 45 items) and wearing War Boy - Yellow, a fresh login shows 99510 diamonds and the mask still worn.
+
