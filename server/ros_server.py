@@ -5,6 +5,7 @@ import os
 import ssl
 import struct
 import threading
+import time
 
 import athlete_requests  # client->server Athlete calls by name (server/athlete_requests.py)
 import account_link  # RoS_Server account link (/api/v1/gateway); off when GATEWAY_API_KEY is empty
@@ -468,17 +469,17 @@ def parse_client_bundle(pkt):
     return out
 
 
-def avatar_create_messages():
+def avatar_create_messages(map_id=None, char_type=None, name=None, entity=None):
     """Tutorial route: hand the client to a battle Avatar (client type 43).
     PlayerAvatar.onBecomePlayer -> MapLoader.onHandshake -> loadMap(currentMapID) loads the map
     itself (const.DTS_TUTORIAL_MAP = 701); PlayerAvatar.prerequisites only needs a scene, so the
     player can enter once the map is up. Returns createBasePlayer + createCellPlayer messages."""
     import pickle as _pk
     D = bwdefs.Defs()
-    name = os.environ.get("CBP_NAME", "GuestLocal").encode()
+    name = (name or os.environ.get("CBP_NAME", "GuestLocal")).encode()
     gid = account_link.current_gid()
-    map_id = int(os.environ.get("AVATAR_MAP", "701"))
-    char_type = int(os.environ.get("AVATAR_CHAR", "30001"))
+    map_id = int(map_id or os.environ.get("AVATAR_MAP", "701"))
+    char_type = int(char_type or os.environ.get("AVATAR_CHAR", "30001"))
     ov = {
         "playerUUID": bwdefs.blob(bytes(range(16))),
         "playerName": bwdefs.blob(name), "identifierName": bwdefs.blob(name),
@@ -490,7 +491,7 @@ def avatar_create_messages():
         "msHttpAP": bwdefs.blob(_pk.dumps((LOCAL_SERVER_IP, 443, 80), protocol=2)),
     }
     log_b, log_c = [], []
-    ent = os.environ.get("AVATAR_ENTITY", "Avatar")
+    ent = entity or os.environ.get("AVATAR_ENTITY", "Avatar")
     import json as _json
     types_ = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "extract", "client_entity_types.json")))
     base = bwdefs.stream_for(D, ent, ov, log_b)
@@ -631,6 +632,52 @@ def get_account_portrait():
     return v if isinstance(v, str) else ""
 
 
+def _inventory_key():
+    return "inventory:" + str(account_link.current_gid())
+
+
+def local_state():
+    """Owned appearance items, equipped outfit (all lists + lobby theme) and diamonds saved on
+    this server (saved_accounts.json), same shape as account_link.get_state():
+    {"yuanbao", "items": [{"prop_id"}], "outfit": {body, wear, weapon, vehicle, theme}}."""
+    v = load_accounts().get(_inventory_key()) or {}
+    return {"yuanbao": int(v.get("yuanbao", int(os.environ.get("ATHLETE_FREE_YUANBAO", "50000"))
+                                     + int(os.environ.get("ATHLETE_PAY_YUANBAO", "50000")))),
+            "items": [{"prop_id": int(i)} for i in v.get("items", [])],
+            "outfit": dict(v.get("outfit") or {})}
+
+
+def save_local_state(yuanbao=None, add_items=(), outfit=None):
+    v = load_accounts().get(_inventory_key()) or {}
+    if yuanbao is not None:
+        v["yuanbao"] = int(yuanbao)
+    if add_items:
+        owned = [int(i) for i in v.get("items", [])]
+        for i in add_items:
+            if int(i) not in owned:
+                owned.append(int(i))
+        v["items"] = owned
+    if outfit is not None:
+        v["outfit"] = outfit
+    save_account(_inventory_key(), v)
+
+
+def _gender_key():
+    return "gender:" + str(account_link.current_gid())
+
+
+def get_account_gender():
+    """Hall appearance gender (dtsAppearanceGender: 1 male, 2 female) and the body parts
+    (face/hair...) remembered for each gender: (gender, {"1": [...], "2": [...]})."""
+    v = load_accounts().get(_gender_key()) or {}
+    g = int(v.get("gender", os.environ.get("ATHLETE_GENDER", "1")))
+    return (g if g in (1, 2) else 1), dict(v.get("body") or {})
+
+
+def set_account_gender(gender, body_by_gender):
+    save_account(_gender_key(), {"gender": int(gender), "body": body_by_gender})
+
+
 def set_account_portrait(file_id):
     save_account(_portrait_key(), file_id)         # local copy (works without RoS_Server)
     if account_link.current() and not account_link.set_portrait(file_id):
@@ -638,14 +685,43 @@ def set_account_portrait(file_id):
 
 
 def _child_props_with_portrait(D, portrait):
-    """childBaseClientPropertyList (ARRAY of one FIXED_DICT): defaults + portrait."""
+    """childBaseClientPropertyList (ARRAY of one FIXED_DICT): defaults + portrait + game-clock
+    times. signAwardTime = now means "signed in today": iDtsSignin.onCheckEnterSignInUI opens
+    the sign-in popup (UIDtsSign) when checkDtsSigninNotSameDay() and signAwardLevel < max,
+    and with no sign-in data served that popup is an empty mask that blocks the lobby."""
+    now = int(athlete_requests.game_now())
+    times = {"signAwardTime": struct.pack("<q", now), "signAwardRefreshTime": struct.pack("<q", now + 86400),
+             "luckySeasonEndTime": struct.pack("<i", now + 30 * 86400),
+             "luckyRoundRefreshTime": struct.pack("<i", now + 21600),
+             "luckyRoundCloseTime": struct.pack("<i", now + 172800)}
     for prop, ttext, _flags, _owner in D.base_client_props("Athlete"):
         if prop == "childBaseClientPropertyList":
             fields = D.resolve(ttext)[1][1]
             elem = b"".join(bwdefs.blob(portrait.encode()) if name == "portrait"
-                            else bwdefs.encode_default(sub, fdef) for name, sub, fdef in fields)
+                            else times.get(name) or bwdefs.encode_default(sub, fdef) for name, sub, fdef in fields)
             return struct.pack("<I", 1) + elem
     return None
+
+
+# Daily sign-in rewards by day (client legacyProperties.iterDtsSigninData, days 1-5).
+SIGNIN_AWARDS = [200027, 203011, 200012, 203012, 291210]
+
+
+def _first_login_today():
+    """enterHall(BOOL firstLoginToday): True makes UIMgr.enterHallUI run the login popups
+    (daily sign-in UIDtsSign, recruit/recall, weekly supply push, ...). The sign-in popup needs
+    childBaseClientPropertyList, which cannot be sent yet, and then blocks the lobby as an
+    empty mask. HALL_POPUPS: off (default) / daily (first login per game day) / on."""
+    mode = os.environ.get("HALL_POPUPS", "off")
+    if mode == "on":
+        return b"\x01"
+    if mode == "daily":
+        import time as _t
+        day = _t.strftime("%Y-%m-%d", _t.gmtime(athlete_requests.game_now()))
+        if (load_accounts().get("login_day") or {}).get("day") != day:
+            save_account("login_day", {"day": day})
+            return b"\x01"
+    return b"\x00"
 
 
 def get_account_name():
@@ -688,6 +764,26 @@ def get_account_char():
     return acc.get("char_type", int(os.environ.get("ATHLETE_CHAR", "30001")))
 
 
+# Character type GENDER from the client's character table (legacyProperties.getCharactersData).
+CHAR_GENDER = {10001: 1, 10002: 1, 20001: 1, 20002: 2, 30001: 2}
+# Hall body used when the ♂/♀ switch needs a character of the other gender.
+GENDER_CHAR = {1: int(os.environ.get("MALE_CHAR", "20001")), 2: int(os.environ.get("FEMALE_CHAR", "20002"))}
+
+
+def current_gender():
+    """dtsAppearanceGender: the character type's own GENDER, else the saved switch."""
+    return CHAR_GENDER.get(get_account_char()) or get_account_gender()[0]
+
+
+def set_account_char(char_type):
+    """Store the character type locally and on RoS_Server (keeps the nickname)."""
+    acc = load_accounts().get("default") or {}
+    acc["char_type"] = int(char_type)
+    save_account("default", acc)
+    if account_link.current() and not account_link.set_character(get_account_name(), int(char_type)):
+        print(f"      [ACC-LINK] character type {char_type} not saved to RoS_Server")
+
+
 def build_custom_room_info(room_name, creator_name, gid, map_id=1, team_size=4):
     import pickle
     b = bwdefs.blob(room_name.encode())
@@ -708,6 +804,7 @@ def build_custom_room_info(room_name, creator_name, gid, map_id=1, team_size=4):
     return b
 
 
+HALL_TEAM_MAP_GROUP = 1   # const.DtsMapBaseType.MAP_4K (client default, map 700)
 LOGIN_STATE = None   # RoS_Server gateway state of the account logging in (account_link.get_state)
 
 
@@ -717,12 +814,28 @@ def login_yuanbao():
     return int(os.environ.get("ATHLETE_FREE_YUANBAO", "50000")) + int(os.environ.get("ATHLETE_PAY_YUANBAO", "50000"))
 
 
+# Outfit list -> (equipped, shown) Athlete properties, and the client methods updating them.
+LIST_PROPS = {"body": ("dtsBodyAppearanceList", "dtsShowBodyAppearanceList"),
+              "wear": ("dtsWearableAppearanceList", "dtsShowWearableAppearanceList"),
+              "weapon": ("dtsWeaponAppearanceList", "dtsShowWeaponAppearanceList"),
+              "vehicle": ("dtsVehicleAppearanceList", "dtsShowVehicleAppearanceList")}
+LIST_METHODS = {"body": ("onUpdateDtsBodyAppearanceList", "onUpdateDtsShowBodyAppearanceList"),
+                "wear": ("onUpdateDtsWearableAppearanceList", "onUpdateDtsShowWearableAppearanceList"),
+                "weapon": ("onUpdateDtsWeaponAppearanceList", "onUpdateDtsShowWeaponAppearanceList"),
+                "vehicle": ("onUpdateVehicleAppearanceList", "onUpdateDtsShowVehicleAppearanceList")}
+
+
 def athlete_create_message():
     """createBasePlayer for the hall player: Athlete (client type 56), all 720 BASE_AND_CLIENT
     props in .def parse order (bwdefs.py), defaults + identity overrides."""
     global LOGIN_STATE
     D = bwdefs.Defs()
     LOGIN_STATE = account_link.get_state() if account_link.current() else None
+    local = local_state()
+    if LOGIN_STATE is None:                        # not linked: this server's own saved state
+        LOGIN_STATE = local
+    elif local["outfit"]:                          # RoS_Server keeps body/wear only
+        LOGIN_STATE["outfit"] = {**local["outfit"], **{k: v for k, v in (LOGIN_STATE.get("outfit") or {}).items() if v}}
     new_user = is_new_account()
     raw_name = "" if new_user else get_account_name()
     name = raw_name.encode() if raw_name else b""
@@ -741,6 +854,7 @@ def athlete_create_message():
         "needNormalRoomTip": struct.pack("<b", 0),
         "needOBRoomTip": struct.pack("<b", 0),
         "baseCharacterType": struct.pack("<I", char_type),
+        "dtsAppearanceGender": struct.pack("<i", current_gender()),
         "freeYuanbao": struct.pack("<q", login_yuanbao() if LOGIN_STATE is not None
                                    else int(os.environ.get("ATHLETE_FREE_YUANBAO", "50000"))),
         "payYuanbao": struct.pack("<q", 0 if LOGIN_STATE is not None
@@ -758,16 +872,19 @@ def athlete_create_message():
             ov["dtsAppearancePackage"] = _encode_appearance_pkg(bwdefs, owned, 20000)
         arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", int(i)) for i in ids)
         outfit = LOGIN_STATE.get("outfit") or {}
-        if outfit.get("wear"):
-            ov["dtsWearableAppearanceList"] = ov["dtsShowWearableAppearanceList"] = arr(outfit["wear"])
-        if outfit.get("body"):
-            ov["dtsShowBodyAppearanceList"] = arr(outfit["body"])
-        print(f"[*] RoS_Server state: {LOGIN_STATE.get('yuanbao')} diamonds, {len(owned)} items, outfit={outfit}")
+        for kind, (equipped, shown) in LIST_PROPS.items():
+            if outfit.get(kind):
+                ov[equipped] = ov[shown] = arr(outfit[kind])
+        if outfit.get("theme"):
+            ov["dtsHallThemeID"] = struct.pack("<i", int(outfit["theme"]))
+        print(f"[*] account state: {LOGIN_STATE.get('yuanbao')} diamonds, {len(owned)} items, outfit={outfit}")
+    # Sent only with a portrait: a full element currently misaligns the client's stream by
+    # 2 bytes within its first ~70 bytes (SequenceDataType "Invalid size" -> EOFError on the
+    # following PYTHON props -> login fails). The default (empty array) works.
     portrait = get_account_portrait()
-    if portrait:
-        child = _child_props_with_portrait(D, portrait)
-        if child:
-            ov["childBaseClientPropertyList"] = child
+    child = _child_props_with_portrait(D, portrait) if portrait else None
+    if child:
+        ov["childBaseClientPropertyList"] = child
     cur_raw = os.environ.get("ATHLETE_SEED_CURRENCY", "1:10000,2:1000").strip()
     if cur_raw:
         curs = []
@@ -810,6 +927,10 @@ class GateUDP(asyncio.DatagramProtocol):
         self._supply = {}           # addr -> athlete_requests.SupplyState
         self._wallet = {}           # addr -> athlete_requests.Wallet
         self._outfit = {}           # addr -> athlete_requests.Outfit
+        self._owned_items = {}      # addr -> set of owned appearance prop ids
+        self._team = {}             # addr -> hall team mode (createHallTeam)
+        self._in_battle = {}        # addr -> handed to the battle Avatar (Athlete decoding off)
+        self._last_bf = {}          # addr -> BF key of the latest packet (for delayed sends)
     def connection_made(self, transport):
         self.transport = transport
     def datagram_received(self, data, addr):
@@ -1011,7 +1132,8 @@ class GateUDP(asyncio.DatagramProtocol):
 
                 # Athlete client->server requests (exposed base methods), decoded by name
                 # (athlete_requests.py; ids fitted on real traffic).
-                if self._athlete_sent.get(addr):
+                if self._athlete_sent.get(addr) and not self._in_battle.get(addr):
+                    self._last_bf[addr] = bytes(bf_key)
                     for m, p in msgs:
                         call = athlete_requests.decode(m, p)
                         if call:
@@ -1205,7 +1327,7 @@ class GateUDP(asyncio.DatagramProtocol):
                 athlete_method("onSyncSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
                 athlete_method("onSetSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
                 self._lobby_data_calls() +
-                athlete_method("enterHall", b"\x01")
+                athlete_method("enterHall", _first_login_today())
             )
             cur_seq = self._last_client_seq.get(addr)
             self._send_bundle(addr, calls, cur_seq, bytes(bf_key))
@@ -1239,7 +1361,7 @@ class GateUDP(asyncio.DatagramProtocol):
                         athlete_method("onSyncSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
                         athlete_method("onSetSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
                         self._lobby_data_calls() +
-                        athlete_method("enterHall", b"\x01"))
+                        athlete_method("enterHall", _first_login_today()))
             if name == "requestRoomListInfo":
                 return athlete_method("onRequestRoomListInfo", struct.pack("<I", 0) + struct.pack("<i", 0))
             if name == "requestRoomCountInfo":
@@ -1282,9 +1404,64 @@ class GateUDP(asyncio.DatagramProtocol):
                     return calls + athlete_method("onMultiOpenSupplyBox", struct.pack("<i", sid) + py(prizes))
                 return calls + athlete_method("onOpenSupplyBox", struct.pack("<i", sid) + py(prizes) + bytes([1 if watch_ad else 0]))
 
-            # Wardrobe / mall buys. Hall props are paid in the client's own listed currency
-            # and price (extract/hallprop_prices.json); the won item is added for the session.
-            if name in ("buyDtsHallProp", "buyMallGoodInAppearanceMall", "buyMallGood"):
+            # Store (UIMall & co.): the client only enables BUY for goods listed in its
+            # availableMallGoodsDict, which these replies fill (extract/mall_goods.json).
+            if name == "queryAvailableMallGoodsByType":
+                types = rd.u32()
+                goods = athlete_requests.mall_goods(types)
+                print(f"      [BASEAPP] mall goods type={types} -> {len(goods)} goods")
+                return athlete_method("onQueryAvailableMallGoodsByType", struct.pack("<I", types) + self._mall_py(goods))
+            if name == "queryAvailableMallGoods":
+                return athlete_method("onQueryAvailableMallGoods", self._mall_py(athlete_requests.mall_goods(0)))
+            if name == "queryAvailableMallGoodsForAppearanceMall":
+                return athlete_method("onQueryAvailableMallGoodsForAppearanceMall",
+                                      py(athlete_requests.appearance_mall_goods()))
+            if name in ("buyMallGood", "buyMallGoodInAppearanceMall"):
+                good, num = rd.i32(), rd.i32()
+                price = athlete_requests.mall_good_price(good, num)
+                prop = athlete_requests.mall_good_prop(good)
+                if price is None or prop is None:
+                    print(f"      [BASEAPP] {name} {good}: not a buyable mall good")
+                    return athlete_method("onBuyMallGoodFailed", _bw_blob(b"") + struct.pack("<iiii", good, num, 0, 0)
+                                          + struct.pack("<I", 0) + _bw_blob(b""))
+                cur, amount = price
+                diamonds = amount if cur == athlete_requests.YUANBAO else 0
+                props = [prop] * max(num, 1)
+                if not self._settle(addr, diamonds, props, f"mall:{good}x{num}"):
+                    print(f"      [BASEAPP] {name} {good}: not enough currency {cur} ({amount})")
+                    return athlete_method("onBuyMallGoodFailed", _bw_blob(b"") + struct.pack("<iiii", good, num, cur, amount)
+                                          + struct.pack("<I", 0) + _bw_blob(b""))
+                print(f"      [BASEAPP] {name} {good} x{num} -> prop {prop}, paid {amount} (currency {cur})")
+                return ((self._diamond_props(addr) if diamonds else b"") + self._grant_props(props, force=True) +
+                        athlete_method("onBuyMallGood", struct.pack("<I", len(props)) +
+                                       b"".join(struct.pack("<i", p) for p in props)))
+
+            # Store multi-buy (e.g. Lobby Theme "Selected n/4" -> BUY): goods[], nums[], coupons[],
+            # logStr. One charge for the total; reply like buyMallGood with every granted prop.
+            if name == "buyMultipleMallGood":
+                goods, nums, _coupons = rd.i32_array(), rd.i32_array(), rd.i32_array()
+                nums += [1] * (len(goods) - len(nums))
+                total, props, bad = 0, [], []
+                for good, num in zip(goods, nums):
+                    price, prop = athlete_requests.mall_good_price(good, num), athlete_requests.mall_good_prop(good)
+                    if price is None or prop is None or price[0] != athlete_requests.YUANBAO:
+                        bad.append(good)
+                        continue
+                    total += price[1]
+                    props += [prop] * max(num, 1)
+                if bad or not props or not self._settle(addr, total, props, f"mall-multi:{goods}"):
+                    print(f"      [BASEAPP] buyMultipleMallGood {goods}: failed (unbuyable {bad}, total {total})")
+                    g0 = goods[0] if goods else 0
+                    return athlete_method("onBuyMallGoodFailed", _bw_blob(b"") + struct.pack("<iiii", g0, 1, athlete_requests.YUANBAO, total)
+                                          + struct.pack("<I", 0) + _bw_blob(b""))
+                print(f"      [BASEAPP] buyMultipleMallGood {goods} -> props {props}, paid {total}")
+                return (self._diamond_props(addr) + self._grant_props(props, force=True) +
+                        athlete_method("onBuyMallGood", struct.pack("<I", len(props)) +
+                                       b"".join(struct.pack("<i", p) for p in props)))
+
+            # Wardrobe hall-prop buys, paid in the client's own listed currency and price
+            # (extract/hallprop_prices.json); the won item is added for the session.
+            if name == "buyDtsHallProp":
                 good = rd.i32()
                 price = athlete_requests.hallprop_price(good) if name == "buyDtsHallProp" else None
                 cur, amount = price or (athlete_requests.YUANBAO, 0)
@@ -1296,24 +1473,163 @@ class GateUDP(asyncio.DatagramProtocol):
                 print(f"      [BASEAPP] {name} {good} price={price}")
                 return (self._diamond_props(addr) if diamonds else b"") + self._grant_props([good], force=True) + athlete_method("onBuyMallGood", struct.pack("<Ii", 1, good))
 
+            # Daily sign-in popup (UIDtsSign) "Claim": the popup stays as a dim mask until this
+            # answer arrives. Award per day = client legacyProperties.iterDtsSigninData awardID.
+            if name == "requestDtsSigninAward":
+                import time as _tm
+                day = _tm.strftime("%Y-%m-%d", _tm.gmtime(athlete_requests.game_now()))
+                st = load_accounts().get("signin") or {"level": 0, "day": ""}
+                level = st["level"] if st.get("day") == day else min(st["level"] + 1, len(SIGNIN_AWARDS))
+                save_account("signin", {"level": level, "day": day})
+                award = SIGNIN_AWARDS[max(level, 1) - 1]
+                print(f"      [BASEAPP] sign-in claim -> level {level}, award {award}")
+                return athlete_method("onRequestDtsSignInAward",
+                                      struct.pack("<Ii", 1, award) + struct.pack("<i", level))
+
+            if name == "setHasAlreadyShowSupplyID":
+                sid = rd.i32()
+                save_account("supply_push", {"id": sid})
+                print(f"      [BASEAPP] weekly supply push shown: box {sid}")
+                return athlete_method("onUpdateAlreadyShowSupplyID", struct.pack("<i", sid))
+
             if name == "getOpenMaintenanceFightTipFlag":     # START button asks this first
                 return athlete_method("onGetOpenMaintenanceFightTipFlag", b"\x00" + struct.pack("<i", 0))
 
+            # START, then: createHallTeam(mode) -> a one-player team; getReadyForBattleGround ->
+            # ready + matching timer (client iHallTeam.py; BattleMatchState NONE 0 / MATCHING 1 /
+            # ENTERING 2 / PRE_ENTERING 3). Entering the battle itself is not implemented yet.
+            if name == "createHallTeam":
+                mode = rd.i32()
+                self._team[addr] = mode
+                gid = account_link.current_gid()
+                members = struct.pack("<I", 1) + self._hall_team_member(addr)
+                print(f"      [BASEAPP] createHallTeam mode={mode} -> onEnterHallTeam (solo, leader {gid})")
+                return athlete_method("onEnterHallTeam", struct.pack("<iQb", mode, gid, 1) + members +
+                                      struct.pack("<i", HALL_TEAM_MAP_GROUP) + b"\x00\x00")
+            if name == "getReadyForBattleGround":
+                gid = account_link.current_gid()
+                print(f"      [BASEAPP] getReadyForBattleGround -> ready + MATCHING")
+                return (athlete_method("syncReadyState", struct.pack("<QBB", gid, 1, 0)) +
+                        athlete_method("syncMatchState", struct.pack("<hqB", 1, int(athlete_requests.game_now()), 0) + py(None)) +
+                        athlete_method("syncMatchingProgress", struct.pack("<iif", 1, 100, 0.0)))
+            # matchBattleGround(1): "match found" at once -> ENTERING, then hand the client to a
+            # battle Avatar (like BaseEntity.giveClientTo): resetEntities + createBasePlayer +
+            # createCellPlayer; PlayerAvatar.onBecomePlayer loads currentMapID itself.
+            if name == "matchBattleGround":
+                print(f"      [BASEAPP] matchBattleGround -> ENTERING")
+                if os.environ.get("BATTLE_ENTER", "on") == "on":
+                    asyncio.get_event_loop().call_later(float(os.environ.get("BATTLE_DELAY", "3")),
+                                                        self._enter_battle, addr)
+                return athlete_method("syncMatchState", struct.pack("<hqB", 2, int(athlete_requests.game_now()), 0) + py(None))
+            if name in ("notReadyForBattleGround", "cancelMatchBattleGround"):   # timer X sends cancel
+                gid = account_link.current_gid()
+                print(f"      [BASEAPP] {name} -> not ready + NONE")
+                return (athlete_method("syncReadyState", struct.pack("<QBB", gid, 0, 0)) +
+                        athlete_method("syncMatchState", struct.pack("<hqB", 0, 0, 0) + py(None)))
+
+            # Equip (clothes, face/hair/decorations, weapon & vehicle skins, lobby theme), as the
+            # client's DtsAppearance.<type>.equipAppearanceRequestServer does it.
             if name == "equipAppearance":
                 pid = rd.i32()
+                slot = athlete_requests.appearance_slot(pid)
+                if slot and slot[2] not in (0, current_gender()):
+                    return athlete_method("onNotifyEquipAppearanceFailed", _bw_blob(b"I_DTS_APPEARANCE_GENDER_INVALID"))
                 outfit = self._session_outfit(addr)
                 kind = outfit.equip(pid)
-                if kind and account_link.current() and not account_link.set_outfit(outfit.body, outfit.wear):
-                    print("      [ACC-LINK] outfit not saved to RoS_Server")
+                if not kind:
+                    print(f"      [BASEAPP] equipAppearance {pid}: type not tracked ({athlete_requests.appearance_type(pid)})")
+                    return athlete_method("onNotifyEquipedAppearance", struct.pack("<i", pid))
+                self._save_outfit(outfit)
+                print(f"      [BASEAPP] equipAppearance {pid} ({kind}) -> {outfit.to_dict()}")
+                return self._outfit_calls(outfit, kind) + athlete_method("onNotifyEquipedAppearance", struct.pack("<i", pid))
+
+            # Clothes suits (Depot > SET): put on = show every piece; the pieces you own are worn.
+            if name in ("putOnAppearanceClothSuit", "takeOffAppearanceClothSuit"):
+                sid = rd.i32()
+                suit = athlete_requests.appearance_suit(sid)
+                if not suit:
+                    print(f"      [BASEAPP] {name} {sid}: unknown suit")
+                    return b""
+                if suit["gender"] not in (0, current_gender()):
+                    return athlete_method("onNotifyEquipAppearanceFailed", _bw_blob(b"I_DTS_APPEARANCE_GENDER_INVALID"))
+                outfit = self._session_outfit(addr)
+                owned = self._owned(addr)
+                kinds = set()
+                for pid in suit["items"]:
+                    if name == "takeOffAppearanceClothSuit":
+                        worn = pid in getattr(outfit, outfit.kind(pid) or "body", [])
+                        kinds.add(outfit.equip(pid) if worn else outfit.try_off(pid))
+                    elif pid in owned:
+                        if pid not in getattr(outfit, outfit.kind(pid) or "body", []):
+                            kinds.add(outfit.equip(pid))
+                    else:
+                        kinds.add(outfit.try_on(pid))
+                kinds.discard(None)
+                if name == "putOnAppearanceClothSuit":
+                    # equip() resets the shown list; re-show the pieces only tried on
+                    for pid in suit["items"]:
+                        if pid not in owned:
+                            outfit.try_on(pid)
+                self._save_outfit(outfit)
+                print(f"      [BASEAPP] {name} {sid} '{suit['name']}' {suit['items']} -> {outfit.to_dict()}")
+                return b"".join(self._outfit_calls(outfit, k) for k in kinds)
+
+            # Hall gender switch (♂/♀ under the model; also restored when leaving the action
+            # preview). iDtsEquipAppearanceAthlete.onSetDtsAppearanceGender sets
+            # dtsAppearanceGender and resets the hall model, so the gender's body parts go first.
+            if name == "setDtsAppearanceGender":
+                gender = rd.i32()
+                if gender not in (1, 2):
+                    print(f"      [BASEAPP] setDtsAppearanceGender: bad gender {gender}")
+                    return b""
+                old, body_by = get_account_gender()
+                outfit = self._session_outfit(addr)
+                body_by[str(old)] = list(outfit.body)
+                outfit.body = [int(i) for i in body_by.get(str(gender), [])]
+                set_account_gender(gender, body_by)
+                outfit.show_body = None
+                self._save_outfit(outfit)
+                # The hall model is built from baseCharacterType (UIMain.resetMainModel ->
+                # player.getCharacterType()), and each type has a fixed GENDER in the client's
+                # character table, so the gender flag alone only flips the UI.
+                char = get_account_char()
+                if CHAR_GENDER.get(char) != gender:
+                    char = GENDER_CHAR[gender]
+                    set_account_char(char)
                 arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", i) for i in ids)
-                calls = b""
-                if kind == "body":
-                    calls += (athlete_method("onUpdateDtsShowBodyAppearanceList", arr(outfit.body)))
-                elif kind == "wear":
-                    calls += (athlete_method("onUpdateDtsWearableAppearanceList", arr(outfit.wear)) +
-                              athlete_method("onUpdateDtsShowWearableAppearanceList", arr(outfit.wear)))
-                print(f"      [BASEAPP] equipAppearance {pid} ({kind}) body={outfit.body} wear={outfit.wear}")
-                return calls + athlete_method("onNotifyEquipedAppearance", struct.pack("<i", pid))
+                print(f"      [BASEAPP] setDtsAppearanceGender {old} -> {gender}, char={char}, body={outfit.body}")
+                return (athlete_method("onUpdateDtsShowBodyAppearanceList", arr(outfit.body)) +
+                        athlete_method("updateBaseCharacter", struct.pack("<i", char)) +
+                        athlete_method("onSetDtsAppearanceGender", struct.pack("<i", gender)))
+
+            # Wardrobe preview (DtsAppearance.tryOnAppearanceRequestServer): swap the item into the
+            # shown list only; leaving the wardrobe sends cancelTryOnAllRequest.
+            if name == "tryOnAppearance":
+                pid = rd.i32()
+                slot = athlete_requests.appearance_slot(pid)
+                if slot and slot[2] not in (0, current_gender()):
+                    print(f"      [BASEAPP] tryOnAppearance {pid}: other gender ({slot[2]})")
+                    return b""
+                outfit = self._session_outfit(addr)
+                kind = outfit.try_on(pid)
+                if not kind or kind == "theme":
+                    print(f"      [BASEAPP] tryOnAppearance {pid}: no shown list ({athlete_requests.appearance_type(pid)})")
+                    return b""
+                shown = outfit.shown(kind)
+                print(f"      [BASEAPP] tryOnAppearance {pid} ({kind}) -> shown {shown}")
+                return self._show_list_calls(kind, shown)
+            if name == "tryOffAppearance":
+                pid = rd.i32()
+                outfit = self._session_outfit(addr)
+                kind = outfit.try_off(pid)
+                if not kind or kind == "theme":
+                    return b""
+                print(f"      [BASEAPP] tryOffAppearance {pid} ({kind}) -> shown {outfit.shown(kind)}")
+                return self._show_list_calls(kind, outfit.shown(kind))
+            if name == "cancelTryOnAllRequest":
+                outfit = self._session_outfit(addr)
+                outfit.cancel_try_on()
+                return b"".join(self._show_list_calls(k, outfit.shown(k)) for k in outfit.LISTS)
 
             # Avatar upload: token for the FilePicker upload, then the chosen file id.
             if name == "requestFilePickerToken":
@@ -1326,6 +1642,41 @@ class GateUDP(asyncio.DatagramProtocol):
         except Exception as e:
             print(f"      [BASEAPP] Error handling Athlete.{name}: {e!r}")
         return b""
+
+    @staticmethod
+    def _show_list_calls(kind, ids):
+        arr = struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", int(i)) for i in ids)
+        return athlete_method(LIST_METHODS[kind][1], arr)
+
+    @staticmethod
+    def _outfit_calls(outfit, kind):
+        """Equipped + shown list updates for one outfit list (or the lobby theme id)."""
+        if kind == "theme":
+            return athlete_method("onUpdateDtsHallThemeID", struct.pack("<i", outfit.theme))
+        ids = getattr(outfit, kind)
+        arr = struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", int(i)) for i in ids)
+        return athlete_method(LIST_METHODS[kind][0], arr) + GateUDP._show_list_calls(kind, outfit.shown(kind))
+
+    @staticmethod
+    def _save_outfit(outfit):
+        save_local_state(outfit=outfit.to_dict())
+        if account_link.current() and not account_link.set_outfit(outfit.body, outfit.wear):
+            print("      [ACC-LINK] outfit not saved to RoS_Server")
+
+    def _owned(self, addr):
+        """Appearance items this account owns (saved state at login + bought/won since)."""
+        if addr not in self._owned_items:
+            self._owned_items[addr] = {int(i["prop_id"]) for i in (LOGIN_STATE or {}).get("items", [])}
+        return self._owned_items[addr]
+
+    @staticmethod
+    def _mall_py(goods):
+        """Pickled goods dict; entity messages are var16 (< 64 KB), so the full catalogue
+        (1160 goods) drops NAME, which the client also has in its own mall table."""
+        blob = athlete_requests.py(goods)
+        if len(blob) > 60000:
+            blob = athlete_requests.py({k: {f: v for f, v in g.items() if f != "NAME"} for k, g in goods.items()})
+        return blob
 
     def _diamond_props(self, addr):
         """iCurrency.onYBUpdated(freeYuanbao, payYuanbao, src) with the session's diamond balance
@@ -1341,10 +1692,7 @@ class GateUDP(asyncio.DatagramProtocol):
 
     def _session_outfit(self, addr):
         if addr not in self._outfit:
-            outfit = athlete_requests.Outfit()
-            saved = (LOGIN_STATE or {}).get("outfit") or {}
-            outfit.body, outfit.wear = list(saved.get("body", [])), list(saved.get("wear", []))
-            self._outfit[addr] = outfit
+            self._outfit[addr] = athlete_requests.Outfit.from_dict((LOGIN_STATE or {}).get("outfit"))
         return self._outfit[addr]
 
     def _settle(self, addr, diamonds, props, reason):
@@ -1357,9 +1705,45 @@ class GateUDP(asyncio.DatagramProtocol):
                 return False
             if result:
                 wallet.balances[athlete_requests.YUANBAO] = int(result["yuanbao"])
+                self._owned(addr).update(int(p) for p in props)
                 return True
             print(f"      [ACC-LINK] {reason}: RoS_Server unreachable, not saved")
-        return wallet.pay(athlete_requests.YUANBAO, diamonds) if diamonds else True
+        if diamonds and not wallet.pay(athlete_requests.YUANBAO, diamonds):
+            return False
+        # Not linked: keep the purchase on this server (saved_accounts.json "inventory:<gid>").
+        self._owned(addr).update(int(p) for p in props)
+        save_local_state(yuanbao=wallet.balances.get(athlete_requests.YUANBAO, 0), add_items=props)
+        return True
+
+    def _enter_battle(self, addr):
+        if self._in_battle.get(addr) or addr not in self._last_bf:
+            return
+        self._in_battle[addr] = True
+        map_id = int(os.environ.get("BATTLE_MAP", "700"))
+        char = int(os.environ.get("BATTLE_CHAR", "0")) or get_account_char()
+        # BattleGroundAvatar (Avatar + iDtsEquip/iDtsProp/iDtsPackage/iDtsEquipAppearanceAvatar):
+        # plain Avatar lacks dtsBattlegroundPropAppearanceList (PlayerCommonAppear.onInit).
+        ent = os.environ.get("BATTLE_ENTITY", "BattleGroundAvatar")
+        cbp_msg, ccp_msg = avatar_create_messages(map_id, char, get_account_name(), ent)
+        print(f"      [BASEAPP] -> battle: resetEntities + {ent} (map {map_id}, char {char})")
+        self._send_bundle(addr, b"\x04\x00" + cbp_msg + ccp_msg, self._last_client_seq.get(addr), self._last_bf[addr])
+
+    def _hall_team_member(self, addr):
+        """HALL_TEAM_MEMBER_CLIENT for our own player: .def defaults plus identity and outfit."""
+        D = bwdefs.Defs()
+        outfit = self._session_outfit(addr)
+        arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", i) for i in ids)
+        ov = {"entID": struct.pack("<i", int(os.environ.get("ATHLETE_ID", "10002"))),
+              "gid": struct.pack("<Q", account_link.current_gid()),
+              "nickname": bwdefs.blob(get_account_name().encode()),
+              "level": struct.pack("<i", 1),
+              "characterType": struct.pack("<i", get_account_char()),
+              "inWorld": b"\x01",
+              # 0 is not a theme prop (iHallTeam.onEnterHallTeam -> getHallThemeScore(0) -> None.PROP_TYPE)
+              "hallThemeID": struct.pack("<i", outfit.theme or int(os.environ.get("HALL_THEME_ID", "270000"))),
+              "dtsBodyAppearanceList": arr(outfit.body),
+              "dtsWearableAppearanceList": arr(outfit.wear)}
+        return b"".join(ov.get(n) or bwdefs.encode_default(t, fd) for n, t, fd in D.resolve("HALL_TEAM_MEMBER_CLIENT")[1])
 
     def _grant_props(self, prop_ids, force=False):
         """Add won appearance items to the client's package (other prop kinds: display only)."""
@@ -1377,7 +1761,7 @@ class GateUDP(asyncio.DatagramProtocol):
         """Client-side Athlete attributes the real server fills at login (lobby UI reads them in
         UIMain.on_enter; a missing one aborts the whole lobby UI setup)."""
         import pickle, time as _t
-        now = int(_t.time())
+        now = int(athlete_requests.game_now())
         lucky = {
             "operation": 10000,
             "luckySeasonDraws": 0, "luckyRoundCloseTime": now + 172800, "luckySeasonNo": 1,
@@ -1389,7 +1773,33 @@ class GateUDP(asyncio.DatagramProtocol):
         }   # all keys required: refreshLuckyCarnivalData indexes each of them (do not trim)
         py = lambda o: _bw_blob(pickle.dumps(o, protocol=2))
         month_rebate = {"awards": {}, "status": [0] * 32, "gotUpradePropIdxes": [], "exp": 0}
-        calls = b""
+        # Server clock first: client_utils.getServerSysTime() = this origin + elapsed
+        # BigWorld time (10 Hz ticks, hence tenths of a second); without it the client uses
+        # the device clock.
+        calls = (athlete_method("syncServerTime", struct.pack("<q", int(now * 10))) +
+                 athlete_method("syncServerTimeZone", struct.pack("<qqq", 0, 0, 0)))
+        # The monthly Supreme page (UIMonthlySupplyPackage) picks its box with the DEVICE clock
+        # (supplement_utils.getCurrentMonthSupplementID uses time.time(); last box ends
+        # 2022.12.30), so on a 2026 device it is blank and its Awake crashes. Turn the page off:
+        # onSetSwitches = setattr(shared.switches, name, value).
+        # Returning-player sign-in (UIDtsSign via huiliu) and friend recall (Recruit Rewards) pop
+        # up at login once the date is in 2022; their data is not served, so UIDtsSign stays an
+        # empty dim mask that blocks the lobby. Off as well (LOBBY_SWITCHES_OFF, comma list).
+        off = os.environ.get("LOBBY_SWITCHES_OFF", "SysEnableMonthSupply,SysEnableHuiliuRecallSystem,"
+                                                   "EnableRecallPlayer,EnableNewRecallPlayer")
+        for sw in filter(None, (x.strip() for x in off.split(","))):
+            calls += athlete_method("onSetSwitches", _bw_blob(sw.encode()) + b"\x00", quiet=True)
+        # Weekly supply push (UIMgr.gotoThisWeekSupplyPackage) opens Supply at every login
+        # until hasAlreadyShowSupplyID equals this week's box; the client reports it with
+        # setHasAlreadyShowSupplyID.
+        shown = (load_accounts().get("supply_push") or {}).get("id", 0)
+        calls += athlete_method("onUpdateAlreadyShowSupplyID", struct.pack("<i", int(shown)))
+        # Hall theme: dtsHallThemeID defaults to 0, which has no theme data. Leaving the outfit
+        # screen restores the theme (HallTheme.onShowOriTheme -> onThemeChange -> onUIChange),
+        # hits currentThemeData None ('DEFAULT_LIGHT'), aborts leave_ui and leaves every UI
+        # hidden. 270000 = const.DEFAULT_HALL_THEME_ID.
+        calls += athlete_method("onUpdateDtsHallThemeID",
+                                struct.pack("<i", int(os.environ.get("HALL_THEME_ID", "270000"))))
         try:
             calls += athlete_method("onUpdateLuckyCarnivalData", py(lucky))
         except Exception as e:
@@ -1446,7 +1856,7 @@ class GateUDP(asyncio.DatagramProtocol):
         arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", i) for i in ids)
         body_ids = [int(x) for x in os.environ.get("APPEAR_BODY", "").split(",") if x.strip()]
         wear_ids = [int(x) for x in os.environ.get("APPEAR_WEAR", "").split(",") if x.strip()]
-        calls = (athlete_method("onSetDtsAppearanceGender", struct.pack("<i", 1)) +
+        calls = (athlete_method("onSetDtsAppearanceGender", struct.pack("<i", get_account_gender()[0])) +
                  athlete_method("onUpdateDtsShowBodyAppearanceList", arr(body_ids)) +
                  athlete_method("onUpdateDtsShowWearableAppearanceList", arr(wear_ids)))
         self._send_bundle(addr, calls, self._last_client_seq.get(addr), bytes(bf_key))
