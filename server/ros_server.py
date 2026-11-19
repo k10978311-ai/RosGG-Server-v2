@@ -766,7 +766,7 @@ def link_login(username, ip_address):
     test_name = os.environ.get("TEST_ACCOUNT_NAME")
     if linked["is_new"] and test_name:
         # Fixed test account: skip the in-game character screen, as before the link existed.
-        char = int(os.environ.get("ATHLETE_CHAR", "30001"))
+        char = int(os.environ.get("ATHLETE_CHAR", "20001"))      # 30001 is the robot placeholder
         if not account_link.set_character(test_name, char):
             account_link.set_character(f"{test_name}_{uid[-4:]}", char)
     return True
@@ -775,16 +775,22 @@ def link_login(username, ip_address):
 def get_account_char():
     linked = account_link.current()
     if linked and linked.get("char_type") is not None:
-        return int(linked["char_type"])
-    accs = load_accounts()
-    acc = accs.get("default", {})
-    return acc.get("char_type", int(os.environ.get("ATHLETE_CHAR", "30001")))
+        char = int(linked["char_type"])
+    else:
+        acc = load_accounts().get("default", {})
+        char = int(acc.get("char_type", int(os.environ.get("ATHLETE_CHAR", "20001"))))
+    # 30001 = bot_base, the robot placeholder (its table GENDER is 2, so the ♀ switch used to
+    # keep it): never a player body; use the human of the saved gender instead.
+    if char in ROBOT_CHARS:
+        char = GENDER_CHAR[get_account_gender()[0] if get_account_gender()[0] in GENDER_CHAR else 1]
+    return char
 
 
 # Character type GENDER from the client's character table (legacyProperties.getCharactersData).
 CHAR_GENDER = {10001: 1, 10002: 1, 20001: 1, 20002: 2, 30001: 2}
 # Hall body used when the ♂/♀ switch needs a character of the other gender.
 GENDER_CHAR = {1: int(os.environ.get("MALE_CHAR", "20001")), 2: int(os.environ.get("FEMALE_CHAR", "20002"))}
+ROBOT_CHARS = {30001}
 
 
 def current_gender():
@@ -882,8 +888,6 @@ def athlete_create_message():
         "dtsRos2BattleItemPackage": _encode_pkg_items(bwdefs, seed, cap, with_weight=True),
         "dtsRos2EquipBarPackage": _encode_pkg_items(bwdefs, seed[:7], 7),
         "dtsRos2DfdBattleItemPackage": _encode_pkg_items(bwdefs, [], cap, with_weight=True),
-        **({"dtsEmojiList": struct.pack("<I", len(_all_emoji_ids())) + b"".join(struct.pack("<i", int(i)) for i in _all_emoji_ids())}
-           if _all_emoji_ids() else {}),
     }
     if LOGIN_STATE is not None:                    # owned items and worn outfit from RoS_Server
         owned = [int(i["prop_id"]) for i in LOGIN_STATE.get("items", [])]
@@ -1352,12 +1356,18 @@ class GateUDP(asyncio.DatagramProtocol):
                 athlete_method("onRoleCreateSuc", struct.pack("<i", 1)) +
                 athlete_method("onSyncSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
                 athlete_method("onSetSwitches", _bw_blob(b"URGENT_SWITCH_ENABLE_FORCE_UPGRADE") + b"\x00") +
-                self._lobby_data_calls() +
-                athlete_method("enterHall", _first_login_today())
+                self._lobby_data_calls()
             )
             cur_seq = self._last_client_seq.get(addr)
             self._send_bundle(addr, calls, cur_seq, bytes(bf_key))
-            print(f"      [BASEAPP] Sent Athlete.onLogin + onRoleCreateSuc + switches + enterHall(1)")
+            print(f"      [BASEAPP] Sent Athlete.onLogin + onRoleCreateSuc + switches + lobby data")
+            
+            # Send enterHall cleanly in its own bundle to avoid fragmentation corruption
+            hall_call = athlete_method("enterHall", _first_login_today())
+            asyncio.get_event_loop().call_later(
+                0.2, self._send_bundle, addr, hall_call, self._last_client_seq.get(addr), bytes(bf_key)
+            )
+            print(f"      [BASEAPP] Scheduled enterHall in 0.2s")
             # Hall hero model needs a dress refresh after UIMain exists (loader stays None otherwise).
             if os.environ.get("UNLOCK_ALL", "calls") == "calls":
                 asyncio.get_event_loop().call_later(float(os.environ.get("UNLOCK_DELAY", "20")),
@@ -1632,7 +1642,7 @@ class GateUDP(asyncio.DatagramProtocol):
                 # player.getCharacterType()), and each type has a fixed GENDER in the client's
                 # character table, so the gender flag alone only flips the UI.
                 char = get_account_char()
-                if CHAR_GENDER.get(char) != gender:
+                if CHAR_GENDER.get(char) != gender or char not in GENDER_CHAR.values():
                     char = GENDER_CHAR[gender]
                     set_account_char(char)
                 arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", i) for i in ids)
@@ -1853,14 +1863,11 @@ class GateUDP(asyncio.DatagramProtocol):
         except Exception as e:
             print(f"      [BASEAPP] Warning: onAccumulateChargeUpdate skipped: {e}")
         try:
-            # Supply UIs (Looks/Vehicle/Firearms Supply...) read this: {supplementID: ...} for every
-            # supplement the client's own table says is available (extract/supplement_ids.json).
-            sup_info = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                   "extract", "supplement_info.json")))
-            calls += athlete_method("onQueryAvailableSupplement", py(dict((int(k), v) for k, v in sup_info.items())))
+            # Minimal stub for enterHall; full supplement info is sent on demand when opening Supply screen.
+            calls += athlete_method("onQueryAvailableSupplement", py({}))
             calls += athlete_method("onUpdateBuySupplementCntDict", py({}) + py({}) + py({}))
         except Exception as e:
-            print(f"      [BASEAPP] Warning: onQueryAvailableSupplement skipped: {e}")
+            print(f"      [BASEAPP] Warning: onQueryAvailableSupplement stub skipped: {e}")
         try:
             # iVip.syncVipInfo; draw-result and ad screens read vipInfo["level"] / ["rewardStatus"].
             calls += athlete_method("syncVipInfo", py({"level": 0, "exp": 0, "rewardStatus": {}}))
