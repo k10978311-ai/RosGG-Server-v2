@@ -398,13 +398,13 @@ def client_method_ex(index, n_methods, entity_id, args):
         total = nbits + 1
         nbytes = (total + 7) // 8
         packed = (val << (nbytes * 8 - total)).to_bytes(nbytes, "big")
-        return _entity_msg(int(os.environ.get("METHOD_BASE", "0xC0"), 0) | 61, struct.pack("<I", entity_id) + packed + args)
+        return _entity_msg(int(os.environ.get("METHOD_BASE", "0x80"), 0) | 61, struct.pack("<I", entity_id) + packed + args)
     eff = 62 - (n_methods + 192) // 255
     if index < eff:
         return client_method(index, entity_id, args)
     k = index - eff
     payload = struct.pack("<I", entity_id) + bytes([k & 0xFF]) + args
-    return _entity_msg(int(os.environ.get("METHOD_BASE", "0xC0"), 0) | (eff + (k >> 8)), payload)
+    return _entity_msg(int(os.environ.get("METHOD_BASE", "0x80"), 0) | (eff + (k >> 8)), payload)
 
 
 def _entity_msg(msgid, payload):
@@ -439,7 +439,7 @@ def client_method(index, entity_id, args):
     msg id 0xC0 | index (index < 0x3f), **var8** length (confirmed: a var16 length desyncs the
     bundle), then entity id u32 (no entity pre-selected), then args."""
     payload = struct.pack("<I", entity_id) + args
-    return _entity_msg(int(os.environ.get("METHOD_BASE", "0xC0"), 0) | index, payload)
+    return _entity_msg(int(os.environ.get("METHOD_BASE", "0x80"), 0) | index, payload)
 
 
 def parse_client_bundle(pkt):
@@ -550,6 +550,23 @@ def _all_appearance_ids():
     except Exception as e:
         print(f"[*] hall_props.json unavailable: {e}")
         return []
+
+
+def _all_emoji_ids():
+    try:
+        d = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "extract", "hall_props.json")))
+        return list(d.get("by_type", {}).get("EmojiType", []))
+    except Exception:
+        return []
+
+
+def _all_action_ids():
+    try:
+        d = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "extract", "hall_props.json")))
+        by_type = d.get("by_type", {})
+        return list(by_type.get("InGameActionAppearanceType", [])), list(by_type.get("InGameActionSuitAppearanceType", []))
+    except Exception:
+        return [], []
 
 
 def _encode_appearance_pkg(bwdefs, ids, capacity):
@@ -865,6 +882,8 @@ def athlete_create_message():
         "dtsRos2BattleItemPackage": _encode_pkg_items(bwdefs, seed, cap, with_weight=True),
         "dtsRos2EquipBarPackage": _encode_pkg_items(bwdefs, seed[:7], 7),
         "dtsRos2DfdBattleItemPackage": _encode_pkg_items(bwdefs, [], cap, with_weight=True),
+        **({"dtsEmojiList": struct.pack("<I", len(_all_emoji_ids())) + b"".join(struct.pack("<i", int(i)) for i in _all_emoji_ids())}
+           if _all_emoji_ids() else {}),
     }
     if LOGIN_STATE is not None:                    # owned items and worn outfit from RoS_Server
         owned = [int(i["prop_id"]) for i in LOGIN_STATE.get("items", [])]
@@ -1064,6 +1083,11 @@ class GateUDP(asyncio.DatagramProtocol):
                 
                 flags = struct.unpack("<H", pkt[:2])[0]
                 self._last_recv[addr] = _t.time()
+                if not hasattr(self, "_keepalive_started"):
+                    self._keepalive_started = set()
+                if addr not in self._keepalive_started and os.environ.get("TIMER_KEEPALIVE", "on") == "on":
+                    self._keepalive_started.add(addr)
+                    asyncio.get_event_loop().call_later(0.5, self._keepalive, addr, bytes(bf_key), self._ka_gen)
                 print(f"  [{ts}] [BASEAPP RECV] {len(pkt)}B flags=0x{flags:04x} pt={pkt.hex()}")
                 
                 # Check for remote ACKs of our sequence numbers (HAS_ACKS = 0x0004)
@@ -1231,8 +1255,10 @@ class GateUDP(asyncio.DatagramProtocol):
         if gen != self._ka_gen:
             return
         now = _t.time()
-        _flag = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harness", "push_now.flag")
-        if os.path.exists(_flag):
+        _flag1 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harness", "push_now.flag")
+        _flag2 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "harness", "push_now.flag")
+        _flag = _flag1 if os.path.exists(_flag1) else (_flag2 if os.path.exists(_flag2) else None)
+        if _flag:
             try:
                 os.remove(_flag)
                 self._push_appearance(addr, bytes(bf_key))
@@ -1527,7 +1553,7 @@ class GateUDP(asyncio.DatagramProtocol):
                 return (athlete_method("syncReadyState", struct.pack("<QBB", gid, 0, 0)) +
                         athlete_method("syncMatchState", struct.pack("<hqB", 0, 0, 0) + py(None)))
 
-            # Equip (clothes, face/hair/decorations, weapon & vehicle skins, lobby theme), as the
+            # Equip (clothes, face/hair/decorations, weapon & vehicle skins, lobby theme, emojis), as the
             # client's DtsAppearance.<type>.equipAppearanceRequestServer does it.
             if name == "equipAppearance":
                 pid = rd.i32()
@@ -1537,11 +1563,24 @@ class GateUDP(asyncio.DatagramProtocol):
                 outfit = self._session_outfit(addr)
                 kind = outfit.equip(pid)
                 if not kind:
-                    print(f"      [BASEAPP] equipAppearance {pid}: type not tracked ({athlete_requests.appearance_type(pid)})")
+                    app_type = athlete_requests.appearance_type(pid)
+                    print(f"      [BASEAPP] equipAppearance {pid}: type not tracked ({app_type})")
+                    if app_type == "EmojiType":
+                        return (athlete_method("onUpdateDtsEmojiID", struct.pack("<i", pid)) +
+                                athlete_method("onNotifyEquipedAppearance", struct.pack("<i", pid)))
                     return athlete_method("onNotifyEquipedAppearance", struct.pack("<i", pid))
                 self._save_outfit(outfit)
                 print(f"      [BASEAPP] equipAppearance {pid} ({kind}) -> {outfit.to_dict()}")
                 return self._outfit_calls(outfit, kind) + athlete_method("onNotifyEquipedAppearance", struct.pack("<i", pid))
+
+            if name == "unloadAppearance":
+                pid = rd.i32()
+                app_type = athlete_requests.appearance_type(pid)
+                print(f"      [BASEAPP] unloadAppearance {pid} ({app_type})")
+                calls = athlete_method("onNotifyUnloadAppearance", struct.pack("<i", pid))
+                if app_type == "EmojiType":
+                    calls += athlete_method("onUpdateDtsEmojiID", struct.pack("<i", 0))
+                return calls
 
             # Clothes suits (Depot > SET): put on = show every piece; the pieces you own are worn.
             if name in ("putOnAppearanceClothSuit", "takeOffAppearanceClothSuit"):
@@ -1831,6 +1870,29 @@ class GateUDP(asyncio.DatagramProtocol):
             calls += athlete_method("syncMonthPayRebateSpecialAwardInfo", py(month_rebate))
         except Exception as e:
             print(f"      [BASEAPP] Warning: syncMonthPayRebateSpecialAwardInfo skipped: {e}")
+        try:
+            # Event panel (UILimitWelfareController.on_enter) reads personalRecommendCanBuy, set
+            # only by iPersonalRecommend.onPersonalRecommendStateUpdated(state, time, gift, version).
+            # No personal offer: state 0, empty gift list.
+            calls += athlete_method("onPersonalRecommendStateUpdated", struct.pack("<ii", 0, 0) + py([]) + struct.pack("<i", 0))
+        except Exception as e:
+            print(f"      [BASEAPP] Warning: onPersonalRecommendStateUpdated skipped: {e}")
+        try:
+            action_ids, suit_action_ids = _all_action_ids()
+            emoji_ids = _all_emoji_ids()
+            calls += athlete_method("onSyncSwitches", _bw_blob(b"SysEnableInGameAction") + b"\x01", quiet=True)
+            calls += athlete_method("onSetSwitches", _bw_blob(b"SysEnableInGameAction") + b"\x01", quiet=True)
+            calls += athlete_method("onSyncSwitches", _bw_blob(b"SysEnableEmoji") + b"\x01", quiet=True)
+            calls += athlete_method("onSetSwitches", _bw_blob(b"SysEnableEmoji") + b"\x01", quiet=True)
+            if action_ids:
+                calls += athlete_method("syncDtsInGameActionAppearanceIDs", py(action_ids))
+            if suit_action_ids:
+                calls += athlete_method("syncDtsInGameActionSuitAppearanceIDs", py(suit_action_ids))
+            if emoji_ids:
+                arr_fn = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", int(i)) for i in ids)
+                calls += athlete_method("onUpdateDtsEmojiList", arr_fn(emoji_ids))
+        except Exception as e:
+            print(f"      [BASEAPP] Warning: action/emoji sync skipped: {e}")
         return calls
 
     def _unlock_all_batch(self, addr, bf_key, pos):
@@ -1853,14 +1915,29 @@ class GateUDP(asyncio.DatagramProtocol):
                                             self._unlock_all_batch, addr, bf_key, pos + n)
 
     def _push_appearance(self, addr, bf_key):
+        import pickle
         arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", i) for i in ids)
+        py = lambda o: _bw_blob(pickle.dumps(o, protocol=2))
         body_ids = [int(x) for x in os.environ.get("APPEAR_BODY", "").split(",") if x.strip()]
         wear_ids = [int(x) for x in os.environ.get("APPEAR_WEAR", "").split(",") if x.strip()]
         calls = (athlete_method("onSetDtsAppearanceGender", struct.pack("<i", get_account_gender()[0])) +
                  athlete_method("onUpdateDtsShowBodyAppearanceList", arr(body_ids)) +
                  athlete_method("onUpdateDtsShowWearableAppearanceList", arr(wear_ids)))
+        action_ids, suit_action_ids = _all_action_ids()
+        emoji_ids = _all_emoji_ids()
+        try:
+            calls += athlete_method("onSetSwitches", _bw_blob(b"SysEnableInGameAction") + b"\x01", quiet=True)
+            calls += athlete_method("onSetSwitches", _bw_blob(b"SysEnableEmoji") + b"\x01", quiet=True)
+            if action_ids:
+                calls += athlete_method("syncDtsInGameActionAppearanceIDs", py(action_ids))
+            if suit_action_ids:
+                calls += athlete_method("syncDtsInGameActionSuitAppearanceIDs", py(suit_action_ids))
+            if emoji_ids:
+                calls += athlete_method("onUpdateDtsEmojiList", arr(emoji_ids))
+        except Exception as e:
+            print(f"      [BASEAPP] Warning: _push_appearance action/emoji push failed: {e}")
         self._send_bundle(addr, calls, self._last_client_seq.get(addr), bytes(bf_key))
-        print(f"      [BASEAPP] pushed appearance refresh body={body_ids} wear={wear_ids}")
+        print(f"      [BASEAPP] pushed appearance refresh body={body_ids} wear={wear_ids} + actions({len(action_ids)}) emojis({len(emoji_ids)})")
 
     def _transition_to_athlete(self, addr, bf_key):
         """Transition from Avatar battle/tutorial space into Athlete (Lobby/Hall player).
