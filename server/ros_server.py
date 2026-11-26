@@ -11,6 +11,7 @@ import athlete_requests  # client->server Athlete calls by name (server/athlete_
 import account_link  # RoS_Server account link (/api/v1/gateway); off when GATEWAY_API_KEY is empty
 import bwdefs   # BigWorld .def parser (server/bwdefs.py)
 import profile_screens  # My Page / Stats / Credit replies (server/profile_screens.py)
+import hero_rules  # normal male/female hero only (server/hero_rules.py)
 
 CERT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
 HTTPS_PORT = 443
@@ -21,6 +22,55 @@ HTTP_PORT = 80
 GATE_TCP_PORT = 20001
 CURRENT_BF_KEY = None
 CURRENT_SESSION_U32 = None
+
+# --- Per-player sessions ---------------------------------------------------------------
+# The login (Mercury) socket and the BaseApp socket of one client use different UDP ports, and
+# the rest of this file reads the "current" login through module globals (CURRENT_BF_KEY,
+# CURRENT_SESSION_U32, LOGIN_STATE, account_link._current/_login_uid). Each login is kept as a
+# session dict; _activate() swaps one session's values into those globals before its packet or
+# timer is handled (the gateway is single threaded, so a swap per packet is safe).
+_ACTIVE = None          # session whose values are in the globals right now
+_SESSIONS = []          # newest last, capped
+
+
+def _stash():
+    """Copy the globals back into the active session and leave no session active."""
+    global _ACTIVE
+    if _ACTIVE is not None:
+        _ACTIVE["link"] = account_link._current
+        _ACTIVE["login_uid"] = account_link._login_uid
+        _ACTIVE["state"] = LOGIN_STATE
+        _ACTIVE = None
+
+
+def _activate(sess):
+    global _ACTIVE, CURRENT_BF_KEY, CURRENT_SESSION_U32, LOGIN_STATE
+    if sess is None or sess is _ACTIVE:
+        return
+    _stash()
+    CURRENT_BF_KEY = sess["bf"]
+    CURRENT_SESSION_U32 = sess["u32"]
+    LOGIN_STATE = sess["state"]
+    account_link._current = sess["link"]
+    account_link._login_uid = sess["login_uid"]
+    _ACTIVE = sess
+
+
+def _new_session(bf, u32):
+    """Register the login that just completed (globals hold its account_link state)."""
+    global _ACTIVE, LOGIN_STATE
+    sess = {"bf": bf, "u32": u32, "link": account_link._current, "login_uid": account_link._login_uid,
+            "state": None, "addr": None, "confirmed": False, "tried": set(), "t": time.time()}
+    LOGIN_STATE = None
+    _ACTIVE = sess
+    _SESSIONS.append(sess)
+    del _SESSIONS[:-16]
+    return sess
+
+
+def _bf_plain_ok(pt):
+    """A BaseApp packet decrypted with the right key ends in a wastage byte 1..8 and has small flags."""
+    return len(pt) >= 3 and 1 <= pt[-1] <= 8 and struct.unpack("<H", pt[:2])[0] < 0x0200
 
 # Hosts still alive at NetEase: requests are passed through to the real server (resolved via 8.8.8.8).
 PASSTHROUGH_HOSTS = {
@@ -773,7 +823,7 @@ def link_login(username, ip_address):
     test_name = os.environ.get("TEST_ACCOUNT_NAME")
     if linked["is_new"] and test_name:
         # Fixed test account: skip the in-game character screen, as before the link existed.
-        char = int(os.environ.get("ATHLETE_CHAR", "20001"))      # 30001 is the robot placeholder
+        char = hero_rules.normalize_hero(os.environ.get("ATHLETE_CHAR", "20001"))
         if not account_link.set_character(test_name, char):
             account_link.set_character(f"{test_name}_{uid[-4:]}", char)
     return True
@@ -782,31 +832,27 @@ def link_login(username, ip_address):
 def get_account_char():
     linked = account_link.current()
     if linked and linked.get("char_type") is not None:
-        char = int(linked["char_type"])
+        char = linked["char_type"]
     else:
         acc = load_accounts().get("default", {})
-        char = int(acc.get("char_type", int(os.environ.get("ATHLETE_CHAR", "20001"))))
-    # 30001 = bot_base, the robot placeholder (its table GENDER is 2, so the ♀ switch used to
-    # keep it): never a player body; use the human of the saved gender instead.
-    if char in ROBOT_CHARS:
-        char = GENDER_CHAR[get_account_gender()[0] if get_account_gender()[0] in GENDER_CHAR else 1]
-    return char
+        char = acc.get("char_type", os.environ.get("ATHLETE_CHAR", "20001"))
+    # Only the normal male/female heroes are player bodies. Saved 10001/10002 (no hall model),
+    # 30001 (bot_base robot) or any unknown type becomes the hero of the saved gender.
+    return hero_rules.normalize_hero(char, get_account_gender()[0])
 
 
-# Character type GENDER from the client's character table (legacyProperties.getCharactersData).
-CHAR_GENDER = {10001: 1, 10002: 1, 20001: 1, 20002: 2, 30001: 2}
 # Hall body used when the ♂/♀ switch needs a character of the other gender.
-GENDER_CHAR = {1: int(os.environ.get("MALE_CHAR", "20001")), 2: int(os.environ.get("FEMALE_CHAR", "20002"))}
-ROBOT_CHARS = {30001}
+GENDER_CHAR = hero_rules.GENDER_HERO
 
 
 def current_gender():
-    """dtsAppearanceGender: the character type's own GENDER, else the saved switch."""
-    return CHAR_GENDER.get(get_account_char()) or get_account_gender()[0]
+    """dtsAppearanceGender: the gender of the normal hero the account plays."""
+    return hero_rules.hero_gender(get_account_char())
 
 
 def set_account_char(char_type):
-    """Store the character type locally and on RoS_Server (keeps the nickname)."""
+    """Store the (normal hero) character type locally and on RoS_Server (keeps the nickname)."""
+    char_type = hero_rules.normalize_hero(char_type, get_account_gender()[0])
     acc = load_accounts().get("default") or {}
     acc["char_type"] = int(char_type)
     save_account("default", acc)
@@ -905,6 +951,8 @@ def athlete_create_message():
         for kind, (equipped, shown) in LIST_PROPS.items():
             if outfit.get(kind):
                 ov[equipped] = ov[shown] = arr(outfit[kind])
+        if int(LOGIN_STATE.get("head_frame") or 0) > 0:    # worn avatar frame (HeadFrameAppearanceType prop id)
+            ov["headFrameTag"] = struct.pack("<i", int(LOGIN_STATE["head_frame"]))
         if outfit.get("theme"):
             ov["dtsHallThemeID"] = struct.pack("<i", int(outfit["theme"]))
         print(f"[*] account state: {LOGIN_STATE.get('yuanbao')} diamonds, {len(owned)} items, outfit={outfit}")
@@ -923,6 +971,15 @@ def athlete_create_message():
                 continue
             cid, n = part.split(":", 1)
             curs.append(struct.pack("<iq", int(cid), int(n)))
+        # Supply boxes can be paid in tickets (e.g. Looks Supply: currency 91, Supreme: 214/202).
+        # The client checks its own currencyList before it sends a draw, so a missing ticket
+        # balance (shown as 0) blocks every ticket draw. Seed each box currency (not diamonds).
+        seeded = {struct.unpack("<iq", c)[0] for c in curs}
+        n_tickets = int(os.environ.get("ATHLETE_SEED_TICKETS", "999"))
+        if n_tickets > 0:
+            for cid in athlete_requests.supply_ticket_currencies():
+                if cid not in seeded and cid != athlete_requests.YUANBAO:
+                    curs.append(struct.pack("<iq", cid, n_tickets))
         ov["currencyList"] = struct.pack("<I", len(curs)) + b"".join(curs)
     log = []
     stream = bwdefs.stream_for(D, "Athlete", ov, log)
@@ -944,7 +1001,8 @@ class GateUDP(asyncio.DatagramProtocol):
     def __init__(self, port):
         self.port = port
         self._login_replied = {}   # addr -> True, to track post-login packets
-        self._server_seq = 0
+        self._seq = {}              # addr -> next server reliable sequence number
+        self._sess = {}             # BaseApp addr -> session dict (see _SESSIONS)
         self._player_created = {}  # addr -> True once createBasePlayer sent on this channel
         self._last_client_seq = {}  # addr -> latest reliable client seq (for keepalive re-ACKs)
         self._unacked_packets = {}  # addr -> {seq: {'fl', 'body', 'footer_prefix', 'time'}}
@@ -953,7 +1011,7 @@ class GateUDP(asyncio.DatagramProtocol):
         self._hall_entered = {}     # addr -> True once Athlete hall entry calls sent
         self._last_recv = {}        # addr -> time of the last BaseApp packet from the client
         self._last_sent_ka = {}     # addr -> time of last sent keepalive ACK
-        self._ka_gen = 0            # bumped per BaseApp login; stale keepalive timers stop
+        self._ka_gens = {}          # addr -> bumped per BaseApp login; stale keepalive timers stop
         self._supply = {}           # addr -> athlete_requests.SupplyState
         self._wallet = {}           # addr -> athlete_requests.Wallet
         self._outfit = {}           # addr -> athlete_requests.Outfit
@@ -965,7 +1023,6 @@ class GateUDP(asyncio.DatagramProtocol):
         self.transport = transport
     def datagram_received(self, data, addr):
         import time as _t
-        account_link.touch()  # presence lease for the linked player (no I/O on this path)
         is_login = data[:4] == b"\x01\x00\x00\x84"
 
         if is_login:
@@ -995,14 +1052,14 @@ class GateUDP(asyncio.DatagramProtocol):
                         fh.write(str((msgid + 1) & 0xFF))
                 res = loginapp.build_reply(data, LOCAL_SERVER_IP, 25000, msgid)
                 if res:
-                    global CURRENT_BF_KEY
                     pkt, params, bf = res
-                    global CURRENT_SESSION_U32
-                    CURRENT_BF_KEY = bf
-                    CURRENT_SESSION_U32 = loginapp.extract_session_u32(params)
+                    _stash()                # park the previous player's globals; this login owns them now
+                    u32 = loginapp.extract_session_u32(params)
                     if not link_login(params.get("username"), addr[0]):
                         return              # banned/suspended in the admin console: no login reply
-                    sk = CURRENT_SESSION_U32.hex()
+                    _new_session(bf, u32)
+                    account_link.touch()
+                    sk = u32.hex()
                     print(f"  [{_t.strftime('%H:%M:%S')}] [LOGIN] TRY msgid={msgid} (0x{msgid:02x}) -> {len(pkt)}B: {pkt.hex()}")
                     print(f"      user={params.get('username')} session_u32={sk} rest={params.get('rest',b'').hex()} bf={bf.hex() if bf else None}")
                     self.transport.sendto(pkt, addr)
@@ -1020,6 +1077,8 @@ class GateUDP(asyncio.DatagramProtocol):
 
             try:
                 import loginapp
+                self._select_session(addr, data)
+                account_link.touch()          # presence lease for this player (no I/O on this path)
                 bf_key = CURRENT_BF_KEY
                 if not bf_key:
                     try:
@@ -1063,11 +1122,11 @@ class GateUDP(asyncio.DatagramProtocol):
                     self._handshake_done.pop(addr, None)
                     self._athlete_sent.pop(addr, None)
                     self._hall_entered.pop(addr, None)
-                    self._server_seq = 0
-                    self._ka_gen += 1
+                    self._seq[addr] = 0
+                    self._ka_gens[addr] = self._ka_gens.get(addr, 0) + 1
                     if os.environ.get("TIMER_KEEPALIVE", "on") == "on":
                         asyncio.get_event_loop().call_later(
-                            1.0, self._keepalive, addr, bytes(bf_key), self._ka_gen)
+                            1.0, self._keepalive, addr, bytes(bf_key), self._ka_gens.get(addr, 0))
                     
                     # Bundle both candidate reply IDs:
                     reply_msg1 = b"\xff" + struct.pack("<I", 8) + req_id_7 + session_key
@@ -1085,6 +1144,20 @@ class GateUDP(asyncio.DatagramProtocol):
                 # Encrypted BaseApp traffic (channel established)
                 if len(data) % 8 == 0:
                     pt = loginapp.custom_bf_decrypt(bytes(bf_key), data)
+                    if not _bf_plain_ok(pt):
+                        # Wrong key for this address (two players share the same IP): try the
+                        # other sessions' keys and remember the one that decodes.
+                        for other in reversed(_SESSIONS):
+                            if other is self._sess.get(addr) or other["bf"] is None:
+                                continue
+                            alt = loginapp.custom_bf_decrypt(bytes(other["bf"]), data)
+                            if _bf_plain_ok(alt):
+                                print(f"      [SESSION] {addr} -> uid {(other['link'] or {}).get('external_uid') or other['login_uid']}")
+                                self._bind_session(addr, other)
+                                bf_key, pt = other["bf"], alt
+                                break
+                    elif self._sess.get(addr) is not None:
+                        self._sess[addr]["confirmed"] = True
                     wastage = pt[-1]
                     if wastage <= 8:
                         pkt = bytes(pt[:-wastage])
@@ -1099,7 +1172,7 @@ class GateUDP(asyncio.DatagramProtocol):
                     self._keepalive_started = set()
                 if addr not in self._keepalive_started and os.environ.get("TIMER_KEEPALIVE", "on") == "on":
                     self._keepalive_started.add(addr)
-                    asyncio.get_event_loop().call_later(0.5, self._keepalive, addr, bytes(bf_key), self._ka_gen)
+                    asyncio.get_event_loop().call_later(0.5, self._keepalive, addr, bytes(bf_key), self._ka_gens.get(addr, 0))
                 print(f"  [{ts}] [BASEAPP RECV] {len(pkt)}B flags=0x{flags:04x} pt={pkt.hex()}")
                 
                 # Check for remote ACKs of our sequence numbers (HAS_ACKS = 0x0004)
@@ -1170,6 +1243,14 @@ class GateUDP(asyncio.DatagramProtocol):
                                 _new.__dict__.update(_old.__dict__)
                         self._bf_mtime = _mt
                     for m, p in msgs:
+                        if m == 3 and hasattr(battle_flow.Match, "on_position"):
+                            try:
+                                reply = self._battle_match(addr).on_position(p, time.time(), log=print)
+                            except Exception as e:
+                                reply = b""
+                                print(f"      [BATTLE] position failed: {e!r}")
+                            if reply:
+                                self._send_bundle(addr, reply, self._last_client_seq.get(addr), bytes(bf_key))
                         if 0x80 <= m <= 0xBF:
                             try:
                                 reply = battle_flow.Match.handle(self._battle_match(addr), m, p, log=print)
@@ -1193,6 +1274,22 @@ class GateUDP(asyncio.DatagramProtocol):
                         self._athlete_sent.pop(addr, None)
                         self._hall_entered.pop(addr, None)
                         self._transition_to_athlete(addr, bytes(bf_key))
+
+                # Pre-start space entity: BattleGroundSpace with gameStatus 1 makes the client show the
+                # "Starting in N s" countdown, the player count and the safe-zone circle. Sent once, after
+                # the map has had time to load (BATTLE_SPACE_DELAY seconds). BATTLE_SPACE=off disables it.
+                if (self._in_battle.get(addr) and os.environ.get("BATTLE_SPACE", "on") == "on"
+                        and not self.__dict__.setdefault("_space_sent", {}).get(addr)
+                        and time.time() - self.__dict__.setdefault("_battle_t0", {}).get(addr, float("inf"))
+                        >= float(os.environ.get("BATTLE_SPACE_DELAY", "20"))):
+                    self._space_sent[addr] = True
+                    self.__dict__.setdefault("_flight", {})[addr] = {"t0": time.time(), "step": 0}
+                    import battle_flow
+                    stage = 1.0 + (time.time() - self._battle_t0[addr])      # BigWorld.serverTime right now
+                    space = battle_flow.debug_command(f"spacet {stage:.3f}", int(os.environ.get("BATTLE_MAP", "700")),
+                                                      self._battle_match(addr))
+                    print(f"      [BATTLE] space entity (pre-start countdown) -> {len(space)}B")
+                    self._send_bundle(addr, space, self._last_client_seq.get(addr), bytes(bf_key))
 
                 # Battle-flow experiments on a live match: one command per line (battle_flow.debug_command)
                 trig_battle = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trigger_battle.txt")
@@ -1314,11 +1411,62 @@ class GateUDP(asyncio.DatagramProtocol):
                 import traceback
                 print(f"  [{ts}] [BASEAPP ERROR] {e}\n{traceback.format_exc()}")
 
+    def _bind_session(self, addr, sess):
+        """Make `sess` the player on BaseApp address `addr` and load it into the globals."""
+        for a, s in list(self._sess.items()):
+            if s is sess and a != addr:
+                del self._sess[a]
+        old = self._sess.get(addr)
+        if old is not None and old is not sess:
+            old["addr"] = None
+        self._sess[addr] = sess
+        sess["addr"] = addr
+        _activate(sess)
+
+    def _select_session(self, addr, data):
+        """Pick the player a BaseApp packet belongs to. The login socket and the BaseApp socket
+        of a client have different ports (and the session id is the same constant for every
+        client), so a BaseApp login request takes a login that has no channel yet; a wrong guess
+        is corrected by the decrypt check in the encrypted-traffic branch."""
+        if data[:3] == b"\x01\x00\x00":                     # BaseApp login request
+            cur = self._sess.get(addr)
+            if cur is not None:
+                if not cur["confirmed"]:
+                    cur["tried"].add(addr)                  # its key did not work for this client
+                cur["addr"] = None
+                del self._sess[addr]
+            free = [s for s in _SESSIONS if s["addr"] is None and addr not in s["tried"]]
+            if not free:
+                free = [s for s in _SESSIONS if s["addr"] is None]
+                for s in free:
+                    s["tried"].discard(addr)
+            if free:
+                self._bind_session(addr, free[-1])
+            elif cur is not None:
+                self._bind_session(addr, cur)
+            elif _SESSIONS:
+                self._bind_session(addr, _SESSIONS[-1])
+            return
+        sess = self._sess.get(addr)
+        if sess is None and _SESSIONS:
+            unbound = [s for s in _SESSIONS if s["addr"] is None]
+            sess = (unbound or _SESSIONS)[-1]
+            self._bind_session(addr, sess)
+        elif sess is not None:
+            _activate(sess)
+
+    def _enter_addr(self, addr):
+        """Timer callbacks: load the player of `addr` before touching account state."""
+        sess = self._sess.get(addr)
+        if sess is not None:
+            _activate(sess)
+
     def _keepalive(self, addr, bf_key, gen):
         """Timer keepalive: retransmits unacked reliable packets every 0.3s-0.5s until ACKed,
         and sends keepalive ACKs to prevent channel timeout."""
+        self._enter_addr(addr)
         import time as _t, loginapp
-        if gen != self._ka_gen:
+        if gen != self._ka_gens.get(addr, 0):
             return
         now = _t.time()
         _flag1 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harness", "push_now.flag")
@@ -1367,6 +1515,40 @@ class GateUDP(asyncio.DatagramProtocol):
             except Exception as e:
                 print(f"      [BASEAPP] heartbeat failed: {e}")
 
+        # Game clock. BigWorld.serverTime (ticks / 10 + 1) only moves when the server sends setGameTime
+        # (ClientInterface id 3, u32 ticks); the pre-start countdown counts against it. Ticks start at 0
+        # when the avatar is created, so serverTime = 1.0 + seconds in the match. BATTLE_GAMETIME=off disables.
+        if (self._in_battle.get(addr) and c_seq is not None and not unacked
+                and os.environ.get("BATTLE_GAMETIME", "on") == "on"
+                and now - self.__dict__.setdefault("_last_gt", {}).get(addr, 0) >= 1.0):
+            self._last_gt[addr] = now
+            t0 = self.__dict__.setdefault("_battle_t0", {}).get(addr, now)
+            try:
+                self._send_bundle(addr, b"\x03" + struct.pack("<I", int(max(0.0, now - t0) * 10)), c_seq, bf_key)
+            except Exception as e:
+                print(f"      [BASEAPP] game time failed: {e}")
+
+        # Flight sequence after the pre-start countdown (battle_flow.FLIGHT_STEPS): plane, BEFORE_FIGHT, in the air.
+        # BATTLE_FLIGHT=off disables it; BATTLE_PREPARE is the countdown length in seconds (the client's 79).
+        flight = self.__dict__.setdefault("_flight", {}).get(addr)
+        if (flight is not None and self._in_battle.get(addr) and c_seq is not None and not unacked
+                and os.environ.get("BATTLE_FLIGHT", "on") == "on"):
+            import battle_flow
+            if flight["step"] < len(battle_flow.FLIGHT_STEPS):
+                delay, lines = battle_flow.FLIGHT_STEPS[flight["step"]]
+                if now >= flight["t0"] + float(os.environ.get("BATTLE_PREPARE", "79")) + delay:
+                    flight["step"] += 1
+                    stage = "%.3f" % (1.0 + (now - self.__dict__.setdefault("_battle_t0", {}).get(addr, now)))
+                    try:
+                        for line in lines:
+                            data = battle_flow.debug_command(line.format(stage=stage),
+                                                             int(os.environ.get("BATTLE_MAP", "700")), self._battle_match(addr))
+                            if data:
+                                print(f"      [BATTLE] flight {line.format(stage=stage)!r}")
+                                self._send_bundle(addr, data, c_seq, bf_key)
+                    except Exception as e:
+                        print(f"      [BATTLE] flight step failed: {e!r}")
+
         # If no unacked packets, send regular keepalive ACK:
         if not unacked and c_seq is not None and now - self._last_sent_ka.get(addr, 0) > 1.0:
             self._last_sent_ka[addr] = now
@@ -1375,6 +1557,7 @@ class GateUDP(asyncio.DatagramProtocol):
         asyncio.get_event_loop().call_later(0.3, self._keepalive, addr, bf_key, gen)
 
     def _send_enter_hall_calls(self, addr, bf_key):
+        self._enter_addr(addr)
         if self._hall_entered.get(addr):
             return
         self._hall_entered[addr] = True
@@ -1446,9 +1629,12 @@ class GateUDP(asyncio.DatagramProtocol):
             print(f"      [BASEAPP] <- Athlete.{name} args={args.hex()[:80]}")
         try:
             if name == "createCharacter":
-                career_type = rd.i32()
+                requested_type = rd.i32()
                 char_name = rd.string()
-                print(f"      [BASEAPP] Athlete.createCharacter: name='{char_name}', type={career_type}")
+                # Whatever the client sends, the account plays the normal male or female hero.
+                career_type = hero_rules.normalize_hero(requested_type, get_account_gender()[0])
+                set_account_gender(hero_rules.hero_gender(career_type), get_account_gender()[1])
+                print(f"      [BASEAPP] Athlete.createCharacter: name='{char_name}', type={requested_type} -> {career_type}")
                 save_account("default", {"name": char_name, "char_type": career_type})
                 if account_link.current() and not account_link.set_character(char_name, career_type):
                     print(f"      [ACC-LINK] character '{char_name}' not saved to RoS_Server")
@@ -1703,9 +1889,8 @@ class GateUDP(asyncio.DatagramProtocol):
                 # The hall model is built from baseCharacterType (UIMain.resetMainModel ->
                 # player.getCharacterType()), and each type has a fixed GENDER in the client's
                 # character table, so the gender flag alone only flips the UI.
-                char = get_account_char()
-                if CHAR_GENDER.get(char) != gender or char not in GENDER_CHAR.values():
-                    char = GENDER_CHAR[gender]
+                char = GENDER_CHAR[gender]
+                if get_account_char() != char:
                     set_account_char(char)
                 arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", i) for i in ids)
                 print(f"      [BASEAPP] setDtsAppearanceGender {old} -> {gender}, char={char}, body={outfit.body}")
@@ -1745,6 +1930,23 @@ class GateUDP(asyncio.DatagramProtocol):
             # My Page / Stats / Credit screens (server/profile_screens.py), from RoS_Server's profile.
             if name in PROFILE_REQUESTS:
                 return self._profile_reply(addr, name, rd)
+
+            # Name Change dialog and country flag (saved on RoS_Server, so the web profile matches).
+            if name == "changeNicknameWithCard":
+                new_name = rd.string().strip()
+                linked = account_link.current() or {}
+                saved = account_link.set_character(new_name, linked.get("char_type") or get_account_char())                     if linked and new_name else None
+                ok = bool(saved)
+                print(f"      [BASEAPP] changeNicknameWithCard '{new_name}' -> {'saved' if ok else 'refused'}")
+                if not ok:
+                    return athlete_method("onChangeNickname", b"\x00" + _bw_blob(new_name.encode()))
+                return (athlete_method("onChangeNickname", b"" + _bw_blob(new_name.encode())) +
+                        athlete_method("updateBaseNickname", _bw_blob(new_name.encode())))
+            if name == "setNationalFlag":
+                flag = rd.string().strip()
+                saved = account_link.set_national_flag(flag) if account_link.current() else None
+                print(f"      [BASEAPP] setNationalFlag '{flag}' -> {'saved' if saved else 'not saved'}")
+                return b""
 
             # Avatar upload: token for the FilePicker upload, then the chosen file id.
             if name == "requestFilePickerToken":
@@ -1808,8 +2010,11 @@ class GateUDP(asyncio.DatagramProtocol):
         if name == "requireBaseInfo":
             gid = rd.u64()
             nick, score, level = profile_screens.base_info(profile if gid == own_gid else None, get_account_name())
+            print(f"      [BASEAPP] requireBaseInfo gid={gid} own={gid == own_gid} linked={profile is not None} "
+                  f"-> nickname={nick!r} score={score} level={level}")
             return athlete_method("onGetBaseInfo", u64(gid) + _bw_blob(nick.encode()) + b"\x00" + u64(score)
-                                  + struct.pack("<iii", 0, 0, level) + _bw_blob(b""))
+                                  + struct.pack("<iii", 0, 0, level)
+                                  + _bw_blob(profile_screens.national_flag(profile if gid == own_gid else None).encode()))
         if name == "queryPersonalInfo":
             gid = rd.u64()
             linked = account_link.current() or {}
@@ -1880,10 +2085,15 @@ class GateUDP(asyncio.DatagramProtocol):
         return m[addr]
 
     def _enter_battle(self, addr):
+        self._enter_addr(addr)
         if self._in_battle.get(addr) or addr not in self._last_bf:
             return
         self._in_battle[addr] = True
         self.__dict__.setdefault("_matches", {}).pop(addr, None)     # fresh doors/loot for each match
+        self.__dict__.setdefault("_battle_t0", {})[addr] = time.time()
+        self.__dict__.setdefault("_space_sent", {}).pop(addr, None)
+        self.__dict__.setdefault("_last_gt", {}).pop(addr, None)
+        self.__dict__.setdefault("_flight", {}).pop(addr, None)
         map_id = int(os.environ.get("BATTLE_MAP", "700"))
         char = int(os.environ.get("BATTLE_CHAR", "0")) or get_account_char()
         # BattleGroundAvatar (Avatar + iDtsEquip/iDtsProp/iDtsPackage/iDtsEquipAppearanceAvatar):
@@ -2020,6 +2230,7 @@ class GateUDP(asyncio.DatagramProtocol):
 
     def _unlock_all_batch(self, addr, bf_key, pos):
         """Give the test user every appearance item (onAddDtsAppearanceItem), a few per packet."""
+        self._enter_addr(addr)
         import pickle
         ids = _all_appearance_ids()
         n = int(os.environ.get("UNLOCK_BATCH", "12"))
@@ -2038,6 +2249,7 @@ class GateUDP(asyncio.DatagramProtocol):
                                             self._unlock_all_batch, addr, bf_key, pos + n)
 
     def _push_appearance(self, addr, bf_key):
+        self._enter_addr(addr)
         import pickle
         arr = lambda ids: struct.pack("<I", len(ids)) + b"".join(struct.pack("<i", i) for i in ids)
         py = lambda o: _bw_blob(pickle.dumps(o, protocol=2))
@@ -2067,6 +2279,7 @@ class GateUDP(asyncio.DatagramProtocol):
         PlayerAvatar already established Application.scene + Globals.player, satisfying
         prerequisites(). Sending resetEntities + createBasePlayer(Athlete) + enterHall
         causes PlayerAthlete.enterHall -> _realEnterHall -> SceneSystem.loadHallScene."""
+        self._enter_addr(addr)
         if self._athlete_sent.get(addr):
             return
         self._athlete_sent[addr] = True
@@ -2102,11 +2315,11 @@ class GateUDP(asyncio.DatagramProtocol):
         max_body = int(os.environ.get("FRAG_BODY", "1200"))
         if len(body) > max_body:
             chunks = [body[i:i + max_body] for i in range(0, len(body), max_body)]
-            first = self._server_seq
+            first = self._seq.get(addr, 0)
             last = first + len(chunks) - 1
             for n, chunk in enumerate(chunks):
-                seq = self._server_seq
-                self._server_seq += 1
+                seq = self._seq.get(addr, 0)
+                self._seq[addr] = seq + 1
                 fl = 0x0008 | 0x0010 | 0x0040 | 0x0020
                 footer_prefix = struct.pack("<II", first, last) + struct.pack("<I", seq)
                 footer = footer_prefix
@@ -2127,9 +2340,9 @@ class GateUDP(asyncio.DatagramProtocol):
         sent_seq = None
         if body:
             fl |= 0x0010 | 0x0040                # RELIABLE | HAS_SEQUENCE
-            sent_seq = self._server_seq
+            sent_seq = self._seq.get(addr, 0)
             footer_prefix = struct.pack("<I", sent_seq)
-            self._server_seq += 1
+            self._seq[addr] = sent_seq + 1
         footer = footer_prefix
         if client_seq is not None:
             fl |= 0x0004                         # HAS_ACKS
