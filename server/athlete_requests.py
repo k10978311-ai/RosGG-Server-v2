@@ -317,13 +317,15 @@ class Outfit:
     its list (clothes slot, body/decoration category, the same gun, the same vehicle);
     equipping an equipped item again takes it off. The lobby theme is a single id."""
 
-    LISTS = ("body", "wear", "weapon", "vehicle")
+    LISTS = ("body", "wear", "weapon", "vehicle", "bgprop")
 
     def __init__(self):
         for k in self.LISTS:
             setattr(self, k, [])
             setattr(self, "show_" + k, None)     # None: same as equipped
         self.theme = 0
+        for k in self.SINGLES.values():
+            setattr(self, k, 0)
 
     @staticmethod
     def kind(pid):
@@ -333,6 +335,9 @@ class Outfit:
     @staticmethod
     def _same_slot(a, b):
         sa, sb = appearance_slot(a), appearance_slot(b)
+        if sa and sb and sa[0] == sb[0] == "bgprop":
+            # BattleGroundPropAppearanceType.isForSameBattleGroundProp: the battle prop id sets overlap
+            return bool(set(sa[1].split(",")) & set(sb[1].split(",")))
         return bool(sa and sb and sa[0] == sb[0] and sa[1] == sb[1])
 
     @classmethod
@@ -348,6 +353,10 @@ class Outfit:
         kind = self.kind(pid)
         if kind == "theme":
             self.theme = int(pid)
+        elif kind == "bgprop":
+            # item skins (backpack, helmet, vest, parachute ...): the client only swaps, never takes off
+            self.bgprop = self._swap(self.bgprop, pid)
+            self.show_bgprop = None
         elif kind:
             items = getattr(self, kind)
             setattr(self, kind, [i for i in items if i != pid] if pid in items else self._swap(items, pid))
@@ -374,8 +383,20 @@ class Outfit:
         for k in self.LISTS:
             setattr(self, "show_" + k, None)
 
+    # Single-id ITEMS-tab appearances: appearance type -> outfit key (DtsAppearance.<type>.
+    # equipAppearanceRequestServer sets the host id, unload sets 0).
+    SINGLES = {"JetWingsAppearanceType": "jetwings", "ShowAircraftAppearanceType": "aircraft"}
+
+    def set_single(self, app_type, pid):
+        """Equip (pid) or unload (0) a single-id appearance; returns its key or None."""
+        key = self.SINGLES.get(app_type)
+        if key:
+            setattr(self, key, int(pid))
+        return key
+
     def to_dict(self):
-        return {**{k: list(getattr(self, k)) for k in self.LISTS}, "theme": self.theme}
+        return {**{k: list(getattr(self, k)) for k in self.LISTS}, "theme": self.theme,
+                **{k: int(getattr(self, k, 0)) for k in self.SINGLES.values()}}
 
     @classmethod
     def from_dict(cls, d):
@@ -383,4 +404,6 @@ class Outfit:
         for k in cls.LISTS:
             setattr(o, k, [int(i) for i in (d or {}).get(k, [])])
         o.theme = int((d or {}).get("theme") or 0)
+        for k in cls.SINGLES.values():
+            setattr(o, k, int((d or {}).get(k) or 0))
         return o

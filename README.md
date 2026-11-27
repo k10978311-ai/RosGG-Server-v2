@@ -20,7 +20,7 @@ bigworld_gateway/
     scripts/               adb install/setup/DNS scripts (point at ../../server/...)
     frida/                 read-only inspection payloads
   tools/                   probes, test cycles (bash, need adb + frida)
-  docs/                    findings (LOBBY_FINDINGS.md), original README, decompile notes
+  docs/                    findings (LOBBY_FINDINGS.md), gameplay reference, decompile notes
   logs/                    server/dns logs
 ```
 
@@ -51,6 +51,19 @@ Copy `.env.example` to `.env` in this folder (`.env` is gitignored, never commit
 Login -> lobby works (base-only Athlete). Lobby UI loads; remaining work and the debugging
 pattern are in `docs/LOBBY_FINDINGS.md`. Character type is set in `server/saved_accounts.json`
 (`20001` = human male; `30001` = robot placeholder).
+
+## Gameplay documentation (build 617289)
+
+Original ROS gameplay (player-facing behaviour), a **74-function traceability matrix** (client evidence + private-server status), and implementation phases:
+
+| Doc | Purpose |
+|-----|---------|
+| [docs/GAMEPLAY_REFERENCE_617289.md](docs/GAMEPLAY_REFERENCE_617289.md) | Version-verified feature reference |
+| [docs/gameplay_function_matrix.json](docs/gameplay_function_matrix.json) | Per-function `server_status` and blockers |
+| [docs/SERVER_GAMEPLAY_ROADMAP.md](docs/SERVER_GAMEPLAY_ROADMAP.md) | Lobby → match → BR priorities |
+| [docs/LOBBY_FINDINGS.md](docs/LOBBY_FINDINGS.md) | Wire-protocol and harness evidence |
+
+Regenerate the matrix after editing `docs/gameplay_matrix_evidence.yaml`: `python scratch/build_gameplay_matrix.py` (from repo root).
 
 ## Next: real launcher
 A single GUI/CLI launcher can wrap `start.cmd` + `install_ros.ps1`: detect adb device,
